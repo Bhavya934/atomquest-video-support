@@ -1,0 +1,67 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  password  String
+  fullName  String
+  role      String    @default("agent") // agent, admin
+  avatarUrl String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  sessions  Session[]
+}
+
+model Session {
+  id            String         @id @default(uuid())
+  agentId       String
+  agent         User           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  customerName  String?
+  customerEmail String?
+  title         String
+  description   String?
+  status        String         @default("waiting") // waiting, active, paused, ended
+  roomId        String?
+  roomUrl       String?
+  shareToken    String         @unique
+  startedAt     DateTime?
+  endedAt       DateTime?
+  durationSecs  Int?
+  recordingUrl       String?        // path to local recording file
+  recordingStatus    String?        @default("idle") // idle, recording, processing, ready
+  recordingStartedAt DateTime?
+  metadata           String?        // serialized JSON metadata (tags, etc.)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  messages           ChatMessage[]
+  events             SessionEvent[]
+}
+
+model ChatMessage {
+  id         String   @id @default(uuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  senderType String   // agent, customer, system
+  senderName String
+  content    String
+  fileUrl    String?  // path to local uploaded file
+  fileName   String?
+  createdAt  DateTime @default(now())
+}
+
+model SessionEvent {
+  id        String   @id @default(uuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  eventType String   // created, joined, ended, reconnected, status-change
+  actor     String   // agent, customer, system
+  metadata  String?  // serialized JSON metadata
+  createdAt DateTime @default(now())
+}

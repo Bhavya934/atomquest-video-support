@@ -1,0 +1,599 @@
+/*--------------------------------------------------------------
+# Video grid
+--------------------------------------------------------------*/
+
+#videoMediaContainer {
+    z-index: 1;
+    position: absolute;
+    display: flex;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 10px;
+    opacity: 1;
+    align-content: center;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    vertical-align: middle;
+    overflow: hidden;
+    transition: opacity 500ms;
+    /* border: 3px solid blue; */
+}
+
+/* Video container with mouse light effect */
+#videoMediaContainer.mouse-light {
+    background:
+        radial-gradient(
+            1024px 1024px at var(--mouse-x, 50%) var(--mouse-y, 50%),
+            rgba(255, 255, 255, 0.3) 0%,
+            rgba(255, 255, 255, 0.18) 20%,
+            rgba(255, 255, 255, 0.08) 40%,
+            rgba(0, 0, 0, 0) 60%,
+            rgba(0, 0, 0, 0.1) 80%,
+            rgba(0, 0, 0, 0.25) 100%
+        ),
+        var(--body-bg, linear-gradient(135deg, #222, #444));
+    background-blend-mode: multiply, normal;
+    transition: background 0.2s;
+}
+
+#videoPinMediaContainer {
+    z-index: 1;
+    position: absolute;
+    display: none;
+    top: 0;
+    left: 0;
+    width: 75%;
+    height: 100%;
+    border-radius: 10px;
+    box-shadow: var(--box-shadow);
+    overflow: hidden;
+    /* animation: show 0.4s ease; */
+    /* border: 3px solid lime; */
+}
+
+.Camera {
+    position: relative;
+    vertical-align: middle;
+    align-self: center;
+    overflow: hidden;
+    display: inline-block;
+    border-radius: 14px;
+    background: var(--body-bg);
+    box-shadow: var(--box-shadow);
+    animation: show 0.4s ease;
+    container-type: inline-size;
+    container-name: camera;
+}
+
+/* .Camera:hover {
+    border: 3px solid rgb(113, 157, 239);
+} */
+
+.Camera .fa-hand-paper {
+    margin: 10px !important;
+    font-size: 1.5rem !important;
+}
+
+#videoMediaContainer i {
+    position: absolute;
+    display: none;
+    top: 0;
+    color: rgb(0, 255, 71);
+    font-size: 14px;
+    align-items: center;
+    padding: 5px;
+    margin: 5px;
+    width: auto;
+    height: 25px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.4);
+}
+
+.videoAvatarImage {
+    z-index: 1;
+    position: absolute;
+    display: none;
+    width: var(--vmi-wh);
+    height: var(--vmi-wh);
+    border-radius: 50%;
+    transition: box-shadow 0.3s ease;
+}
+
+.audio {
+    position: absolute;
+    right: 0;
+    color: #fff;
+    margin: 5px;
+    width: auto;
+    height: 25px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.1);
+}
+
+.username {
+    z-index: 1;
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    color: #fff;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    padding: 10px;
+    margin: 10px;
+    width: auto;
+    height: 25px;
+    border-radius: 10px;
+    background: var(--body-bg);
+}
+
+.rec-indicator {
+    display: none;
+    margin-left: 8px;
+    white-space: nowrap;
+    background: transparent;
+    animation: none;
+}
+
+.rec-indicator.active {
+    display: inline;
+    animation: recPulsate 3s ease-out infinite;
+}
+
+.rec-indicator.paused {
+    animation: none;
+    opacity: 0.5;
+}
+
+@keyframes recPulsate {
+    0% {
+        opacity: 0.5;
+    }
+    50% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0.5;
+    }
+}
+
+.fscreen {
+    position: absolute;
+    right: 0;
+    bottom: 0px;
+    color: #fff;
+    margin: 5px;
+    width: auto;
+    height: 25px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.1);
+}
+
+/* Video Menu Bar */
+.videoMenuBar {
+    z-index: 2;
+    position: absolute; /* inside video feed by default */
+    top: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    flex-direction: row-reverse; /* invert buttons order visually */
+    justify-content: flex-start; /* with row-reverse, this packs to the right */
+    flex-wrap: nowrap;
+    gap: clamp(2px, 1vw, 8px);
+    padding: clamp(4px, 1.2vw, 8px);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-top-left-radius: 14px;
+    border-top-right-radius: 14px;
+    background: var(--body-bg);
+    /* box-shadow: var(--box-shadow); */
+    cursor: default;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none; /* Firefox */
+    white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Mobile floating menubar when appended to body */
+.videoMenuBar.mobile-floating {
+    z-index: 2;
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    left: 0;
+    right: 0;
+    width: 100vw;
+    border-radius: 0 0 10px 10px;
+}
+
+.videoAvatarMenuBar,
+.videoMenuBarShare {
+    z-index: 2;
+    position: absolute;
+    display: flex;
+    flex-direction: row-reverse;
+    align-items: center;
+    gap: 1px;
+    top: 0;
+    left: 0;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.2);
+    font-size: small;
+    font-weight: bold;
+    text-align: center;
+    width: 100%;
+    cursor: default;
+    overflow: hidden;
+}
+
+/* Mobile: ensure avatar container and menu are above video menu */
+#videoAIContainer {
+    z-index: 100;
+    position: relative;
+}
+
+#videoAIContainer .videoAvatarMenuBar {
+    z-index: 101;
+}
+
+#videoAIElement {
+    z-index: 99;
+}
+
+.avatar-session-timer {
+    font-size: 14px;
+    color: white;
+    margin-right: auto;
+    padding: 4px 8px;
+    white-space: nowrap;
+}
+
+.videoMenuBar input,
+.videoMenuBar button,
+.videoAvatarMenuBar button,
+.videoMenuBarShare button {
+    font-size: clamp(0.9rem, 1vw, 1.05rem);
+    min-width: 36px;
+    min-height: 36px;
+    color: #fff;
+    background: var(--body-bg);
+    border-radius: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    outline: none;
+    cursor: pointer;
+}
+
+.videoMenuBar button:hover,
+.videoAvatarMenuBar button:hover,
+.videoMenuBarShare button:hover {
+    color: #fff;
+    background: var(--btns-bg-color);
+}
+
+/* Touch-friendly sizing for buttons within menu bar */
+.videoMenuBar button {
+    min-width: 32px;
+    min-height: 32px;
+    flex: 0 0 auto;
+}
+
+/* Dropdown overrides - must beat .videoMenuBar div */
+.videoMenuBar div.navbar-dropdown-content {
+    display: none !important;
+}
+
+.videoMenuBar div.navbar-dropdown-item {
+    display: flex !important;
+}
+
+/*--------------------------------------------------------------
+# Navbar dropdown menu
+--------------------------------------------------------------*/
+
+.navbar-dropdown {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
+.navbar-dropdown-content {
+    display: none !important;
+    position: fixed;
+    z-index: 9999;
+    min-width: 180px;
+    background: var(--body-bg);
+    border-radius: 10px;
+    border: var(--border);
+    padding: 6px 0;
+    box-shadow: var(--box-shadow);
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.navbar-dropdown-content.show {
+    display: block !important;
+}
+
+.navbar-dropdown-item {
+    display: flex !important;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    color: #fff;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s ease;
+}
+
+.navbar-dropdown-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.navbar-dropdown-item button,
+.videoMenuBar .navbar-dropdown-item button,
+.videoMenuBar .navbar-dropdown-content .navbar-dropdown-item button {
+    pointer-events: none;
+    background: none !important;
+    border: none !important;
+    color: #fff !important;
+    font-size: 1rem !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    min-width: 20px !important;
+    min-height: auto !important;
+    flex-shrink: 0;
+    border-radius: 0 !important;
+    box-sizing: content-box;
+    transform: none !important;
+}
+
+.navbar-dropdown-item button:hover,
+.videoMenuBar .navbar-dropdown-item button:hover {
+    background: none !important;
+    transform: none !important;
+}
+
+.navbar-dropdown-item span {
+    flex: 1;
+}
+
+#videoMediaContainer video {
+    position: absolute;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.videoCircle {
+    position: absolute;
+    width: var(--vmi-wh);
+    height: var(--vmi-wh);
+    border-radius: 50%;
+    /* reliable centering - works in all scenarios */
+    top: 50% !important;
+    left: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    transition: box-shadow 0.3s ease;
+}
+
+.videoDefault {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    border-radius: '10px';
+    transition: box-shadow 0.3s ease;
+}
+
+video {
+    width: 100%;
+    height: 100%;
+    object-fit: var(--videoObjFit);
+    border-radius: 14px;
+    cursor: pointer;
+    transition: transform 0.3s ease-in-out;
+}
+
+#canvasAIElement {
+    width: 100%;
+    height: 100%;
+    object-fit: var(--videoObjFit);
+    border-radius: 14px;
+    cursor: pointer;
+}
+
+video:hover {
+    filter: contrast(105%);
+}
+
+video:fullscreen {
+    object-fit: contain;
+}
+
+.mirror {
+    -webkit-transform: rotateY(180deg);
+    -moz-transform: rotateY(180deg);
+    transform: rotateY(180deg);
+}
+
+.videoCircle.mirror {
+    -webkit-transform: translate(-50%, -50%) rotateY(180deg) !important;
+    -moz-transform: translate(-50%, -50%) rotateY(180deg) !important;
+    transform: translate(-50%, -50%) rotateY(180deg) !important;
+}
+
+.blur {
+    -webkit-filter: blur(5px);
+    -moz-filter: blur(5px);
+    -o-filter: blur(5px);
+    -ms-filter: blur(5px);
+    filter: blur(5px);
+}
+
+input[type='range'] {
+    /* display: none; */
+    color: #fff;
+    width: 50px;
+    cursor: pointer;
+}
+
+@keyframes show {
+    0% {
+        opacity: 0;
+        transform: scale(0.4) translateY(20px);
+    }
+    100% {
+        opacity: 1;
+        transform: scale(1) translateY(0);
+    }
+}
+
+@container camera (max-width: 260px) {
+    .videoMenuBar {
+        gap: 0px;
+        padding: 4px;
+    }
+    .videoMenuBar button,
+    .videoAvatarMenuBar button,
+    .videoMenuBarShare button {
+        font-size: 0.7rem;
+        min-width: 24px;
+        min-height: 24px;
+    }
+    .videoMenuBar input[type='range'] {
+        width: clamp(20px, 20%, 40px);
+    }
+}
+
+@container camera (min-width: 261px) and (max-width: 400px) {
+    .videoMenuBar {
+        gap: 2px;
+        padding: 3px;
+    }
+    .videoMenuBar button,
+    .videoAvatarMenuBar button,
+    .videoMenuBarShare button {
+        font-size: 0.8rem;
+        min-width: 28px;
+        min-height: 28px;
+    }
+    .videoMenuBar input[type='range'] {
+        width: clamp(30px, 25%, 60px);
+    }
+}
+
+@container camera (min-width: 401px) and (max-width: 640px) {
+    .videoMenuBar {
+        gap: 6px;
+        padding: 8px;
+    }
+    .videoMenuBar button,
+    .videoAvatarMenuBar button,
+    .videoMenuBarShare button {
+        font-size: 0.9rem;
+        min-width: 32px;
+        min-height: 32px;
+    }
+    .videoMenuBar input[type='range'] {
+        width: clamp(40px, 20%, 80px);
+    }
+}
+
+@container camera (min-width: 641px) {
+    .videoMenuBar {
+        gap: 8px;
+        padding: 10px;
+    }
+    .videoMenuBar button,
+    .videoAvatarMenuBar button,
+    .videoMenuBarShare button {
+        font-size: 1rem;
+        min-width: 36px;
+        min-height: 36px;
+    }
+    .videoMenuBar input[type='range'] {
+        width: clamp(50px, 20%, 100px);
+    }
+}
+
+/*--------------------------------------------------------------
+# Video Drawing Overlay (Fabric.js)
+--------------------------------------------------------------*/
+
+/* Fabric.js wraps the canvas in a .canvas-container div.
+   Use a dedicated class so it works when .Camera is removed (pinned state). */
+.video-drawing-wrap {
+    position: absolute !important;
+    top: 0;
+    left: 0;
+    z-index: 1; /* Above video (0), below videoMenuBar (2) */
+    border-radius: 14px;
+    overflow: hidden;
+}
+
+/* The raw canvas element before Fabric wraps it */
+.video-drawing-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+}
+
+/* When drawing is inactive, let all events pass through to the video */
+.video-drawing-inactive {
+    pointer-events: none !important;
+}
+
+/* When drawing is active, capture pointer events and show crosshair */
+.video-drawing-active {
+    pointer-events: auto !important;
+    cursor: crosshair;
+}
+
+/* Ensure the upper-canvas (Fabric.js event layer) inherits pointer-events */
+.video-drawing-active .upper-canvas {
+    pointer-events: auto !important;
+    cursor: crosshair !important;
+}
+
+.video-drawing-inactive .upper-canvas {
+    pointer-events: none !important;
+}
+
+/* Floating label showing who is drawing on the video */
+.video-drawing-label {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 10;
+    padding: 3px 8px;
+    max-width: calc(100% - 16px);
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 10px;
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    opacity: 0;
+    transition: opacity 0.35s ease;
+}
+
+/* Smaller label on narrow video tiles (mobile) */
+@container camera (max-width: 250px) {
+    .video-drawing-label {
+        top: 4px;
+        left: 4px;
+        max-width: calc(100% - 8px);
+        padding: 2px 5px;
+        font-size: 10px;
+    }
+}

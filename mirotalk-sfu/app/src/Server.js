@@ -1,0 +1,5460 @@
+'use strict';
+
+/*
+███████ ███████ ██████  ██    ██ ███████ ██████  
+██      ██      ██   ██ ██    ██ ██      ██   ██ 
+███████ █████   ██████  ██    ██ █████   ██████  
+     ██ ██      ██   ██  ██  ██  ██      ██   ██ 
+███████ ███████ ██   ██   ████   ███████ ██   ██                                           
+
+prod dependencies: {
+    @mattermost/client      : https://www.npmjs.com/package/@mattermost/client
+    @ngrok/ngrok            : https://www.npmjs.com/package/@ngrok/ngrok
+    @sentry/node            : https://www.npmjs.com/package/@sentry/node
+    axios                   : https://www.npmjs.com/package/axios
+    chokidar                : https://www.npmjs.com/package/chokidar
+    colors                  : https://www.npmjs.com/package/colors
+    compression             : https://www.npmjs.com/package/compression
+    cors                    : https://www.npmjs.com/package/cors
+    crypto-js               : https://www.npmjs.com/package/crypto-js
+    discord.js              : https://www.npmjs.com/package/discord.js
+    dompurify               : https://www.npmjs.com/package/dompurify
+    express                 : https://www.npmjs.com/package/express
+    express-openid-connect  : https://www.npmjs.com/package/express-openid-connect
+    fluent-ffmpeg           : https://www.npmjs.com/package/fluent-ffmpeg
+    he                      : https://www.npmjs.com/package/he
+    helmet                  : https://www.npmjs.com/package/helmet
+    httpolyglot             : https://www.npmjs.com/package/httpolyglot
+    js-yaml                 : https://www.npmjs.com/package/js-yaml
+    jsdom                   : https://www.npmjs.com/package/jsdom
+    jsonwebtoken            : https://www.npmjs.com/package/jsonwebtoken
+    mediasoup               : https://www.npmjs.com/package/mediasoup
+    mediasoup-client        : https://www.npmjs.com/package/mediasoup-client
+    nodemailer              : https://www.npmjs.com/package/nodemailer
+    openai                  : https://www.npmjs.com/package/openai
+    qs                      : https://www.npmjs.com/package/qs
+    sanitize-filename       : https://www.npmjs.com/package/sanitize-filename
+    socket.io               : https://www.npmjs.com/package/socket.io
+    swagger-ui-express      : https://www.npmjs.com/package/swagger-ui-express
+    uuid                    : https://www.npmjs.com/package/uuid
+}
+
+dev dependencies: {
+    @babel/core             : https://www.npmjs.com/package/@babel/core
+    @babel/preset-env       : https://www.npmjs.com/package/@babel/preset-env
+    babel-loader            : https://www.npmjs.com/package/babel-loader
+    mocha                   : https://www.npmjs.com/package/mocha
+    node-fetch              : https://www.npmjs.com/package/node-fetch
+    nodemon                 : https://www.npmjs.com/package/nodemon
+    prettier                : https://www.npmjs.com/package/prettier
+    proxyquire              : https://www.npmjs.com/package/proxyquire
+    should                  : https://www.npmjs.com/package/should
+    sinon                   : https://www.npmjs.com/package/sinon
+    webpack                 : https://www.npmjs.com/package/webpack
+    webpack-cli             : https://www.npmjs.com/package/webpack-cli
+}
+*/
+
+/**
+ * MiroTalk SFU - Server component
+ *
+ * @link    GitHub: https://github.com/miroslavpejic85/mirotalksfu
+ * @link    Official Live demo: https://sfu.mirotalk.com
+ * @license For open source use: AGPLv3
+ * @license For commercial or closed source, contact us at license.mirotalk@gmail.com or purchase directly via CodeCanyon
+ * @license CodeCanyon: https://codecanyon.net/item/mirotalk-sfu-webrtc-realtime-video-conferences/40769970
+ * @author  Miroslav Pejic - miroslav.pejic.85@gmail.com
+ * @version 2.2.97
+ *
+ */
+
+const express = require('express');
+const { auth, requiresAuth } = require('express-openid-connect');
+const { withFileLock } = require('./MutexManager');
+const { PassThrough } = require('stream');
+const { S3Client } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
+const { fixDurationOrRemux } = require('./FixDurationOrRemux');
+const cors = require('cors');
+const compression = require('compression');
+const socketIo = require('socket.io');
+const httpolyglot = require('httpolyglot');
+const mediasoup = require('mediasoup');
+const mediasoupClient = require('mediasoup-client');
+const http = require('http');
+const path = require('path');
+const axios = require('axios');
+const ngrok = require('@ngrok/ngrok');
+const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const sanitizeFilename = require('sanitize-filename');
+const helmet = require('helmet');
+const config = require('./config');
+const checkXSS = require('./XSS');
+const mime = require('mime-types');
+const Host = require('./Host');
+const Room = require('./Room');
+const Peer = require('./Peer');
+const ServerApi = require('./ServerApi');
+const Logger = require('./Logger');
+const Validator = require('./Validator');
+const HtmlInjector = require('./HtmlInjector');
+const log = new Logger('Server');
+const yaml = require('js-yaml');
+const swaggerUi = require('swagger-ui-express');
+const swaggerDocument = yaml.load(fs.readFileSync(path.join(__dirname, '/../api/swagger.yaml'), 'utf8'));
+const Sentry = require('@sentry/node');
+const Discord = require('./Discord');
+const Mattermost = require('./Mattermost');
+const restrictAccessByIP = require('./middleware/IpWhitelist');
+const { applyEmbedHeaders, embedAllowedOrigins, embedCsp } = require('./middleware/EmbedHeaders');
+const packageJson = require('../../package.json');
+
+// Login attempts limit
+const rateLimit = require('express-rate-limit');
+const maxAttempts = config?.security?.host?.maxAttempts || 5;
+const minBlockTime = config?.security?.host?.minBlockTime || 15; // minutes
+// Extract client IP (only trust X-Forwarded-For when behind a trusted reverse proxy)
+const ipKeyGenerator = (req) => {
+    const forwarded = Boolean(config?.server?.trustProxy)
+        ? req.headers['x-forwarded-for'] || req.headers['X-Forwarded-For']
+        : null;
+    return (forwarded || '').split(',')[0].trim() || req.socket?.remoteAddress || req.ip;
+};
+// Pluralize "N minute(s)" consistently across limiter messages
+const minutesLabel = (n) => `${n} minute${n === 1 ? '' : 's'}`;
+
+// Derive a stable per-requester rate-limit key (OIDC user > bearer-token user > IP)
+const getRequesterKey = (req) => {
+    if (config?.security?.oidc?.enabled && req.oidc?.isAuthenticated()) {
+        return req.oidc?.user?.sub || req.oidc?.user?.email || ipKeyGenerator(req);
+    }
+    const token = getBearerToken(req);
+    if (token) {
+        try {
+            const { username } = decodeToken(token);
+            if (username) {
+                return `user:${String(username).trim().toLowerCase()}`;
+            }
+        } catch (_) {
+            // Fall back to token hash key if the token cannot be decoded.
+        }
+        return `token:${token.slice(0, 48)}`;
+    }
+    return ipKeyGenerator(req);
+};
+
+// Create login rate limiter
+const loginLimiter = rateLimit({
+    windowMs: minBlockTime * 60 * 1000,
+    max: maxAttempts,
+    message: {
+        message: `Too many login attempts. Please try again after ${minutesLabel(minBlockTime)}.`,
+    },
+    keyGenerator: (req) => req.body?.username || ipKeyGenerator(req),
+});
+
+// Room scheduler configuration and rate limiter
+const scheduleMeetingCfg = config.features?.scheduleMeeting || {};
+const scheduleMeetingAllowedDomains = scheduleMeetingCfg.allowedDomains || [];
+const scheduleMeetingLimiterWindowMs = scheduleMeetingCfg.rateLimit?.windowMs || 60 * 60 * 1000;
+const scheduleMeetingLimiterMax = scheduleMeetingCfg.rateLimit?.max || 5;
+const scheduleMeetingLimiterMinutes = Math.ceil(scheduleMeetingLimiterWindowMs / (60 * 1000));
+const scheduleMeetingMaxRecipients = scheduleMeetingCfg.maxRecipients || 20;
+
+const scheduleMeetingLimiter = rateLimit({
+    windowMs: scheduleMeetingLimiterWindowMs,
+    max: scheduleMeetingLimiterMax,
+    message: {
+        message: `Too many schedule meeting requests. Please try again after ${minutesLabel(scheduleMeetingLimiterMinutes)}.`,
+    },
+    keyGenerator: getRequesterKey,
+});
+
+// Active rooms endpoint rate limiter (per IP) — public endpoint, so prevent
+// enumeration / scraping abuse without breaking the public "event zone" UX.
+const activeRoomsLimiterCfg = config.ui?.rooms?.activeRoomsRateLimit || {};
+const activeRoomsLimiterWindowMs = activeRoomsLimiterCfg.windowMs || 60 * 1000;
+const activeRoomsLimiterMax = activeRoomsLimiterCfg.max || 60;
+const activeRoomsLimiterMinutes = Math.ceil(activeRoomsLimiterWindowMs / (60 * 1000));
+const activeRoomsLimiter = rateLimit({
+    windowMs: activeRoomsLimiterWindowMs,
+    max: activeRoomsLimiterMax,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+        error: `Too many requests. Please try again after ${minutesLabel(activeRoomsLimiterMinutes)}.`,
+    },
+    keyGenerator: (req) => ipKeyGenerator(req),
+});
+
+// Socket.IO createRoom rate limiter (per IP) — sliding window in memory.
+// Prevents unauthenticated sockets from spamming arbitrary room entries
+// into the in-memory roomList (which feeds /api/v1/activeRooms).
+const createRoomLimiterCfg = config.features?.createRoomRateLimit || {};
+const createRoomLimiterWindowMs = createRoomLimiterCfg.windowMs || 60 * 1000;
+const createRoomLimiterMax = createRoomLimiterCfg.max || 10;
+const createRoomLimiterMinutes = Math.ceil(createRoomLimiterWindowMs / (60 * 1000));
+const createRoomHits = new Map(); // ip -> number[] (timestamps)
+function checkCreateRoomLimit(ip) {
+    const now = Date.now();
+    const windowStart = now - createRoomLimiterWindowMs;
+    const hits = (createRoomHits.get(ip) || []).filter((t) => t > windowStart);
+    if (hits.length >= createRoomLimiterMax) {
+        createRoomHits.set(ip, hits);
+        return false;
+    }
+    hits.push(now);
+    createRoomHits.set(ip, hits);
+    return true;
+}
+// Periodic cleanup to bound memory.
+setInterval(
+    () => {
+        const cutoff = Date.now() - createRoomLimiterWindowMs;
+        for (const [ip, hits] of createRoomHits) {
+            const kept = hits.filter((t) => t > cutoff);
+            if (kept.length === 0) createRoomHits.delete(ip);
+            else createRoomHits.set(ip, kept);
+        }
+    },
+    Math.max(createRoomLimiterWindowMs, 60 * 1000)
+).unref?.();
+
+// Branding configuration
+const brandHtmlInjection = config?.ui?.brand?.htmlInjection ?? true;
+
+// Incoming Stream to RTPM
+const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto-js');
+const RtmpStreamer = require('./RtmpStreamer.js'); // Import the RtmpStreamer class
+const rtmpCfg = config?.media?.rtmp;
+const rtmpDir = rtmpCfg?.dir || 'rtmp';
+
+// Compute total active RTMP streams from actual sources (live + file + URL)
+function getRtmpTotalActiveStreamsCount() {
+    let count = Object.keys(streams).length;
+    for (const [, room] of roomList) {
+        if (room.isRtmpFileStreamerActive()) count++;
+        if (room.isRtmpUrlStreamerActive()) count++;
+    }
+    return count;
+}
+
+// Email alerts and notifications
+const nodemailer = require('./lib/nodemailer');
+const { SCHEDULE_MEETING_LIMITS } = nodemailer;
+
+// Slack API
+const CryptoJS = require('crypto-js');
+const qS = require('qs');
+const slackEnabled = config?.integrations?.slack?.enabled || false;
+const slackSigningSecret = config?.integrations?.slack?.signingSecret || '';
+
+const app = express();
+
+const options = {
+    cert: fs.readFileSync(path.join(__dirname, config?.server?.ssl.cert || '../ssl/cert.pem'), 'utf-8'),
+    key: fs.readFileSync(path.join(__dirname, config?.server?.ssl.key || '../ssl/key.pem'), 'utf-8'),
+};
+
+const corsOptions = {
+    origin: config.server?.cors?.origin || '*',
+    methods: config.server?.cors?.methods || ['GET', 'POST'],
+};
+
+let server;
+if (process.env.MIROTALK_HTTP_ONLY === 'true') {
+    server = http.createServer(app);
+} else {
+    server = httpolyglot.createServer(options, app);
+}
+
+const io = socketIo(server, {
+    maxHttpBufferSize: 1e7,
+    transports: ['websocket'],
+    cors: corsOptions,
+});
+
+const host = config?.server?.hostUrl || `http://localhost:${config?.server?.listen?.port || 3010}`;
+const trustProxy = Boolean(config?.server?.trustProxy);
+
+const jwtCfg = {
+    JWT_KEY: config?.security?.jwt?.key || 'mirotalksfu_jwt_secret',
+    JWT_EXP: config?.security?.jwt?.exp || '1h',
+};
+
+const hostCfg = {
+    protected: config?.security?.host?.protected,
+    authenticated: !config?.security?.host?.protected,
+    user_auth: config?.security?.host?.user_auth,
+    users: config?.security?.host?.users,
+    users_from_db: config?.security?.host?.users_from_db,
+    users_api_room_allowed: config?.security?.host?.users_api_room_allowed,
+    users_api_rooms_allowed: config?.security?.host?.users_api_rooms_allowed,
+    users_api_endpoint: config?.security?.host?.users_api_endpoint,
+    users_api_secret_key: config?.security?.host?.users_api_secret_key,
+    api_room_exists: config?.security?.host?.api_room_exists,
+    presenters: config?.security?.host?.presenters,
+};
+
+const widget = {
+    enabled: config?.ui?.brand?.widget?.enabled,
+    roomId: config?.ui?.brand?.widget?.roomId || 'support-room',
+    alert: {
+        enabled: config?.ui?.brand?.widget?.alert?.enabled,
+        type: config?.ui?.brand?.widget?.alert?.type || 'email',
+    },
+};
+
+const restApi = {
+    basePath: '/api/v1', // api endpoint path
+    docs: host + '/api/v1/docs', // api docs
+    allowed: config.api?.allowed || {},
+};
+
+// Sentry monitoring
+const sentryEnabled = config.integrations?.sentry?.enabled || false;
+const sentryDSN = config.integrations.sentry.DSN;
+const sentryTracesSampleRate = config.integrations.sentry.tracesSampleRate;
+if (sentryEnabled && typeof sentryDSN === 'string' && sentryDSN.trim()) {
+    log.info('Sentry monitoring started...');
+
+    Sentry.init({
+        dsn: sentryDSN,
+        tracesSampleRate: sentryTracesSampleRate,
+    });
+
+    // Accept logLevels as an array, e.g., ['warn', 'error']
+    const logLevels = config.integrations?.sentry?.logLevels || ['error'];
+
+    const stripAnsi = (str) => (typeof str === 'string' ? str.replace(/\u001b\[[\d;]*m/g, '') : str);
+
+    const sanitizeArgs = (args) =>
+        args
+            .map((arg) =>
+                typeof arg === 'string' ? stripAnsi(arg) : typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+            )
+            .join(' ');
+
+    const originalConsole = {};
+    logLevels.forEach((level) => {
+        originalConsole[level] = console[level];
+        console[level] = function (...args) {
+            switch (level) {
+                case 'warn':
+                    Sentry.captureMessage(sanitizeArgs(args), 'warning');
+                    break;
+                case 'error':
+                    args[0] instanceof Error
+                        ? Sentry.captureException(args[0])
+                        : Sentry.captureException(new Error(sanitizeArgs(args)));
+                    break;
+            }
+            originalConsole[level].apply(console, args);
+        };
+    });
+
+    // log.error('Sentry error', { foo: 'bar' });
+    // log.warn('Sentry warning');
+}
+
+// Handle WebHook
+const webhook = {
+    enabled: config?.integrations?.webhook?.enabled || false,
+    url: config?.integrations?.webhook?.url || 'http://localhost:8888/webhook-endpoint',
+};
+
+// Discord Bot
+const { enabled, commands, token } = config?.integrations?.discord || {};
+
+if (enabled && commands.length > 0 && token) {
+    const discordBot = new Discord(token, commands);
+    log.info('Discord bot is enabled and starting');
+}
+
+// Stats
+const defaultStats = {
+    enabled: true,
+    src: 'https://stats.mirotalk.com/script.js',
+    id: '41d26670-f275-45bb-af82-3ce91fe57756',
+};
+
+// OpenAI/ChatGPT
+let chatGPT;
+if (config?.integrations?.chatGPT?.enabled) {
+    if (config?.integrations?.chatGPT?.apiKey) {
+        const { OpenAI } = require('openai');
+        const configuration = {
+            basePath: config?.integrations?.chatGPT?.basePath,
+            apiKey: config?.integrations?.chatGPT?.apiKey,
+        };
+        chatGPT = new OpenAI(configuration);
+    } else {
+        log.warn('ChatGPT seems enabled, but you missing the apiKey!');
+    }
+}
+
+// OpenID Connect
+const OIDC = config?.security?.oidc || { enabled: false };
+
+// directory
+const dir = {
+    public: path.join(__dirname, '../../public'),
+    rec: path.join(__dirname, config?.media?.recording?.dir || 'rec'),
+    rtmp: path.join(__dirname, config?.media?.rtmp?.dir || 'rtmp'),
+};
+
+// Rec directory create and set max file size
+const recMaxFileSize = config?.media?.recording?.maxFileSize || 1 * 1024 * 1024 * 1024; // 1GB default
+const serverRecordingEnabled = config?.media?.recording?.enabled || false;
+if (serverRecordingEnabled) {
+    log.debug('Server Recording enabled creating dir', dir.rtmp);
+    if (!fs.existsSync(dir.rec)) {
+        fs.mkdirSync(dir.rec, { recursive: true });
+    }
+}
+
+// Rtmp directory create
+const rtmpEnabled = rtmpCfg && rtmpCfg.enabled;
+if (rtmpEnabled) {
+    log.debug('RTMP enabled creating dir', dir.rtmp);
+    if (!fs.existsSync(dir.rtmp)) {
+        fs.mkdirSync(dir.rtmp, { recursive: true });
+    }
+}
+
+// ####################################################
+// AWS S3 SETUP
+// ####################################################
+
+const s3Client = new S3Client({
+    region: config?.integrations?.s3?.region, // Set your AWS region
+    credentials: {
+        accessKeyId: config?.integrations?.s3?.accessKeyId,
+        secretAccessKey: config?.integrations?.s3?.secretAccessKey,
+    },
+    endpoint: config?.integrations?.s3?.endpoint || undefined,
+    forcePathStyle: config?.integrations?.s3?.forcePathStyle === true,
+});
+
+// html views
+const views = {
+    html: path.join(__dirname, '../../public/views'),
+    about: path.join(__dirname, '../../', 'public/views/about.html'),
+    landing: path.join(__dirname, '../../', 'public/views/landing.html'),
+    login: path.join(__dirname, '../../', 'public/views/login.html'),
+    activeRooms: path.join(__dirname, '../../', 'public/views/activeRooms.html'),
+    customizeRoom: path.join(__dirname, '../../', 'public/views/customizeRoom.html'),
+    newRoom: path.join(__dirname, '../../', 'public/views/newroom.html'),
+    notFound: path.join(__dirname, '../../', 'public/views/404.html'),
+    permission: path.join(__dirname, '../../', 'public/views/permission.html'),
+    privacy: path.join(__dirname, '../../', 'public/views/privacy.html'),
+    room: path.join(__dirname, '../../', 'public/views/Room.html'),
+    rtmpStreamer: path.join(__dirname, '../../', 'public/views/RtmpStreamer.html'),
+    whoAreYou: path.join(__dirname, '../../', 'public/views/whoAreYou.html'),
+};
+
+const filesPath = [
+    views.landing,
+    views.newRoom,
+    views.room,
+    views.login,
+    views.whoAreYou,
+    views.activeRooms,
+    views.customizeRoom,
+];
+
+const htmlInjector = new HtmlInjector(filesPath, config.ui.brand);
+
+const authHost = new Host(); // Authenticated IP by Login
+
+const roomList = new Map(); // All Rooms
+
+const presenters = {}; // Collect presenters grp by roomId
+
+const streams = {}; // Collect all rtmp streams
+const STREAM_TIMEOUT_MS = 60 * 1000; // Cleanup orphaned streams after 60s of inactivity
+
+const webRtcServerActive = config.mediasoup.webRtcServerActive;
+
+// ip (server local IPv4)
+const IP = webRtcServerActive
+    ? config.mediasoup.webRtcServerOptions.listenInfos[0].ip
+    : config.mediasoup.webRtcTransport.listenInfos[0].ip;
+
+// announcedAddress (server public IPv4)
+let announcedAddress = webRtcServerActive
+    ? config.mediasoup.webRtcServerOptions.listenInfos[0].announcedAddress
+    : config.mediasoup.webRtcTransport.listenInfos[0].announcedAddress;
+
+// All mediasoup workers
+const workers = [];
+let nextMediasoupWorkerIdx = 0;
+
+// Autodetect announcedAddress with multiple fallback services
+if (!announcedAddress && IP === '0.0.0.0') {
+    const detectPublicIp = async () => {
+        const services = config.system?.services?.ip || [
+            'http://api.ipify.org',
+            'http://ipinfo.io/ip',
+            'http://ifconfig.me/ip',
+        ];
+
+        for (const service of services) {
+            try {
+                const ip = await fetchPublicIp(service);
+                if (ip) {
+                    announcedAddress = ip;
+                    updateAnnouncedAddress(ip);
+                    startServer();
+                    return;
+                }
+            } catch (err) {
+                log.warn(`Failed to detect IP from ${service}`, err.message);
+            }
+        }
+        throw new Error('All public IP detection services failed! Please check your network connection');
+    };
+
+    detectPublicIp().catch((err) => {
+        log.error('Public IP detection failed', err.message);
+        process.exit(1);
+    });
+} else {
+    startServer();
+}
+
+function fetchPublicIp(serviceUrl) {
+    return new Promise((resolve, reject) => {
+        http.get(serviceUrl, (resp) => {
+            if (resp.statusCode !== 200) {
+                return reject(new Error(`HTTP ${resp.statusCode}`));
+            }
+            let data = '';
+            resp.on('data', (chunk) => (data += chunk));
+            resp.on('end', () => resolve(data.toString().trim()));
+        }).on('error', reject);
+    });
+}
+
+function updateAnnouncedAddress(ip) {
+    const target = webRtcServerActive
+        ? config.mediasoup.webRtcServerOptions.listenInfos
+        : config.mediasoup.webRtcTransport.listenInfos;
+
+    target.forEach((info) => {
+        info.announcedAddress = ip;
+    });
+}
+
+// Custom middleware function for OIDC authentication
+function OIDCAuth(req, res, next) {
+    if (OIDC.enabled) {
+        function handleHostProtected(req) {
+            if (!hostCfg.protected) return;
+
+            const ip = authHost.getIP(req);
+            hostCfg.authenticated = true;
+            authHost.setAuthorizedIP(ip, true);
+            // Check...
+            log.debug('OIDC ------> Host protected', {
+                authenticated: hostCfg.authenticated,
+                authorizedIPs: authHost.getAuthorizedIPs(),
+            });
+        }
+
+        if (req.oidc.isAuthenticated()) {
+            log.debug('OIDC ------> User already Authenticated');
+            handleHostProtected(req);
+            return next();
+        }
+
+        // Apply requiresAuth() middleware conditionally
+        requiresAuth()(req, res, function () {
+            log.debug('OIDC ------> requiresAuth');
+            // Check if user is authenticated
+            if (req.oidc.isAuthenticated()) {
+                log.debug('[OIDC] ------> User isAuthenticated');
+                handleHostProtected(req);
+                next();
+            } else {
+                // User is not authenticated
+                res.status(401).send('Unauthorized');
+            }
+        });
+    } else {
+        next();
+    }
+}
+
+function startServer() {
+    // Start the app
+    app.set('trust proxy', trustProxy); // Enables trust for proxy headers (e.g., X-Forwarded-For) based on the trustProxy setting
+    app.use(helmet.noSniff()); // Enable content type sniffing prevention
+    app.use(applyEmbedHeaders); // Apply iframe embedding restrictions (CSP frame-ancestors / X-Frame-Options)
+    // Use all static files from the public folder
+    app.use(
+        express.static(dir.public, {
+            setHeaders: (res, filePath) => {
+                if (filePath.endsWith('.js')) {
+                    res.setHeader('Content-Type', 'application/javascript');
+                } //...
+            },
+        })
+    );
+    app.use(cors(corsOptions));
+    app.use(compression());
+    app.use(express.json({ limit: '50mb' })); // Handles JSON payloads
+    app.use(express.urlencoded({ extended: true, limit: '50mb' })); // Handles URL-encoded payloads
+    app.use(express.raw({ type: 'video/webm', limit: '50mb' })); // Handles raw binary data
+    app.use(restApi.basePath + '/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument)); // api docs
+
+    // IP Whitelist check ...
+    app.use(restrictAccessByIP);
+
+    // Logs requests
+    /*
+    app.use((req, res, next) => {
+        log.debug('New request:', {
+            headers: req.headers,
+            body: req.body,
+            method: req.method,
+            path: req.originalUrl,
+        });
+        next();
+    });
+    */
+
+    // Mattermost
+    const mattermost = new Mattermost(app);
+
+    // Remove trailing slashes in url handle bad requests
+    app.use((err, req, res, next) => {
+        if (err && (err instanceof SyntaxError || err.status === 400 || 'body' in err)) {
+            log.error('Request Error', {
+                header: req.headers,
+                body: req.body,
+                error: err.message,
+            });
+            return res.status(400).send({ status: 404, message: err.message }); // Bad request
+        }
+
+        // Prevent open redirect attacks by checking if the path is an external domain
+        const cleanPath = req.path.replace(/^\/+/, '');
+        if (/^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}/.test(cleanPath)) {
+            return res.status(400).send('Bad Request: Potential Open Redirect Detected');
+        }
+
+        if (req.path.endsWith('/') && req.path.length > 1) {
+            let query = req.url.substring(req.path.length).replace(/\/$/, ''); // Ensure query params don't end in '/'
+            return res.redirect(301, req.path.slice(0, -1) + query);
+        }
+
+        next();
+    });
+
+    // OpenID Connect - Dynamically set baseURL based on incoming host and protocol
+    if (OIDC.enabled) {
+        // Skip OIDC for static assets to avoid state cookie races on /auth/callback
+        // when `authRequired: true`. See: https://github.com/miroslavpejic85/mirotalksfu/issues/251
+        const oidcStaticAssetRegex =
+            /\.(ico|png|jpe?g|gif|svg|webp|css|js|mjs|map|woff2?|ttf|eot|otf|mp3|mp4|webm|wav|ogg|txt|xml|json|manifest)$/i;
+        const skipStaticAssets = (mw) => (req, res, next) => {
+            if (oidcStaticAssetRegex.test(req.path)) return next();
+            return mw(req, res, next);
+        };
+
+        // Support both `baseURLDynamic` (template key) and legacy `baseUrlDynamic`
+        const oidcDynamicBaseUrl = OIDC.baseURLDynamic === true || OIDC.baseUrlDynamic === true;
+
+        if (oidcDynamicBaseUrl) {
+            // Build an allowlist of origins permitted to be used as the OIDC baseURL.
+            // This prevents Host-header injection from rewriting the redirect_uri
+            // (see: https://portswigger.net/web-security/host-header).
+            // Sources, in order of precedence:
+            //   1. config.security.oidc.allowedDynamicBaseURLs (string[] of full origins)
+            //   2. config.security.oidc.config.baseURL (always trusted)
+            const configuredAllowlist = Array.isArray(OIDC.allowedDynamicBaseURLs) ? OIDC.allowedDynamicBaseURLs : [];
+            const allowedOrigins = new Set(
+                [OIDC.config?.baseURL, ...configuredAllowlist]
+                    .filter(Boolean)
+                    .map((u) => {
+                        try {
+                            return new URL(u).origin;
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .filter(Boolean)
+            );
+
+            // Cache auth middleware instances per origin to avoid re-running OIDC discovery on every request
+            const authMiddlewareCache = new Map();
+
+            app.use(
+                skipStaticAssets((req, res, next) => {
+                    const host = req.headers.host;
+                    const protocol = req.protocol === 'https' ? 'https' : 'http';
+                    const origin = `${protocol}://${host}`;
+
+                    // Reject Host headers that are not in the configured allowlist.
+                    // Without this, an attacker can force the OIDC library to emit a
+                    // redirect_uri pointing to an attacker-controlled domain.
+                    if (!allowedOrigins.has(origin)) {
+                        log.warn('OIDC Host header not in allowlist - rejecting request', {
+                            host,
+                            origin,
+                            allowed: [...allowedOrigins],
+                        });
+                        return res.status(400).send('Bad Request: invalid Host header');
+                    }
+
+                    let cachedAuth = authMiddlewareCache.get(origin);
+                    if (!cachedAuth) {
+                        try {
+                            cachedAuth = auth({ ...OIDC.config, baseURL: origin });
+                            authMiddlewareCache.set(origin, cachedAuth);
+                        } catch (err) {
+                            log.error('OIDC Auth Middleware Error', err);
+                            return next(err);
+                        }
+                    }
+                    cachedAuth(req, res, next);
+                })
+            );
+        } else {
+            // Static baseURL: create auth middleware once at startup
+            try {
+                app.use(skipStaticAssets(auth(OIDC.config)));
+            } catch (err) {
+                log.error('OIDC Auth Middleware Error', err);
+                process.exit(1);
+            }
+        }
+    }
+
+    // Route to display user information
+    app.get('/profile', OIDCAuth, (req, res) => {
+        if (OIDC.enabled) {
+            const user = { ...req.oidc.user };
+            user.peer_name = {
+                force: OIDC.peer_name?.force || false,
+                email: OIDC.peer_name?.email || false,
+                name: OIDC.peer_name?.name || false,
+            };
+            log.debug('OIDC get Profile', user);
+            return res.json(user);
+        }
+
+        // Host protected: return displayname from JWT token
+        if (hostCfg.protected) {
+            const authHeader = req.headers.authorization;
+            const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+            if (token) {
+                try {
+                    const { username } = decodeToken(token);
+                    const user = hostCfg.users.find((u) => u.username === username || u.displayname === username);
+                    const displayname = user?.displayname || username;
+                    log.debug('Host protected get Profile', { username, displayname });
+                    return res.json({
+                        name: displayname,
+                        peer_name: {
+                            force: true,
+                            name: true,
+                        },
+                    });
+                } catch (err) {
+                    log.warn('Profile token decode error', err.message);
+                }
+            }
+        }
+
+        // OIDC disabled, no host protection
+        res.status(201).json({
+            email: false,
+            name: false,
+            peer_name: false,
+            message: 'Profile not found because OIDC is disabled',
+        });
+    });
+
+    // Authentication Callback Route
+    app.get('/auth/callback', (req, res, next) => {
+        next(); // Let express-openid-connect handle this route
+    });
+
+    // Logout Route
+    app.get('/logout', (req, res) => {
+        if (OIDC.enabled) {
+            req.logout(); // Logout user
+        }
+        if (hostCfg.protected) {
+            const ip = authHost.getIP(req);
+            if (authHost.isAuthorizedIP(ip)) {
+                authHost.deleteIP(ip);
+            }
+            hostCfg.authenticated = false;
+            //
+            log.debug('[OIDC] ------> Logout', {
+                authenticated: hostCfg.authenticated,
+                authorizedIPs: authHost.getAuthorizedIPs(),
+            });
+        }
+        res.redirect('/'); // Redirect to the home page after logout
+    });
+
+    // Favicon
+    app.get('/favicon.ico', (req, res) => res.status(204).end());
+
+    // UI buttons configuration
+    app.get('/config', (req, res) => {
+        res.status(200).json({ message: config?.ui?.buttons || false });
+    });
+
+    // Brand configuration
+    app.get('/brand', (req, res) => {
+        res.status(200).json({ message: brandHtmlInjection ? config?.ui?.brand : false });
+    });
+
+    // UI themes configuration
+    app.get('/themes', (req, res) => {
+        res.status(200).json({ message: config?.ui?.themes ? config.ui.themes : false });
+    });
+
+    // main page
+    app.get('/', OIDCAuth, (req, res) => {
+        //log.debug('/ - hostCfg ----->', hostCfg);
+        if (!OIDC.enabled && hostCfg.protected) {
+            hostCfg.authenticated = false;
+            res.redirect('/login');
+            return;
+        } else {
+            return htmlInjector.injectHtml(views.landing, res);
+        }
+    });
+
+    // Route to display rtmp streamer
+    app.get('/rtmp', OIDCAuth, (req, res) => {
+        if (!rtmpCfg || !rtmpCfg.fromStream) {
+            return res.json({ message: 'The RTMP Streamer is currently disabled.' });
+        }
+        return res.sendFile(views.rtmpStreamer);
+    });
+
+    // set new room name and join
+    app.get('/newroom', OIDCAuth, (req, res) => {
+        //log.info('/newroom - hostCfg ----->', hostCfg);
+
+        if (!OIDC.enabled && hostCfg.protected) {
+            hostCfg.authenticated = false;
+            res.redirect('/login');
+            return;
+        } else {
+            htmlInjector.injectHtml(views.newRoom, res);
+        }
+    });
+
+    // Get Active rooms
+    app.get('/activeRooms', OIDCAuth, (req, res) => {
+        htmlInjector.injectHtml(views.activeRooms, res);
+    });
+
+    // Get Customize room
+    app.get('/customizeRoom', OIDCAuth, (req, res) => {
+        htmlInjector.injectHtml(views.customizeRoom, res);
+    });
+
+    // Check if room active (exists)
+    app.post('/isRoomActive', (req, res) => {
+        const { roomId } = checkXSS(req.body);
+
+        if (roomId && (hostCfg.protected || hostCfg.user_auth || OIDC.enabled)) {
+            const roomActive = roomList.has(roomId);
+            if (roomActive) log.debug('isRoomActive', { roomId, roomActive });
+            res.status(200).json({ message: roomActive });
+        } else {
+            res.status(400).json({ message: 'Unauthorized' });
+        }
+    });
+
+    // Check if Widget room active (exists)
+    app.post('/isWidgetRoomActive', (req, res) => {
+        const { roomId } = checkXSS(req.body);
+        const roomWidgetActive = roomId && roomId === widget.roomId && roomList.has(roomId);
+        log.debug('isWidgetRoomActive', { roomId, roomWidgetActive });
+        res.status(200).json({ message: roomWidgetActive });
+    });
+
+    // Schedule Meeting feature flag
+    app.get('/isScheduleMeetingEnabled', (req, res) => {
+        res.status(200).json({ enabled: config.features?.scheduleMeeting?.enabled || false });
+    });
+
+    // Schedule Meeting - send email with .ics calendar attachment
+    app.post('/scheduleMeeting', OIDCAuth, scheduleMeetingLimiter, async (req, res) => {
+        if (!config.features?.scheduleMeeting?.enabled) {
+            return res.status(403).json({ message: 'Schedule meeting is disabled' });
+        }
+
+        const scheduleMeetingRequiresAuth = scheduleMeetingCfg.requireAuth !== false;
+        const hasAuthProviderEnabled = OIDC.enabled || hostCfg.protected || hostCfg.user_auth;
+
+        const authState = await getScheduleMeetingAuthState(req);
+
+        if (scheduleMeetingRequiresAuth) {
+            if (!hasAuthProviderEnabled) {
+                return res.status(403).json({
+                    message: 'Schedule meeting requires authentication, but no auth provider is enabled',
+                });
+            }
+            if (!authState.authorized) {
+                return res.status(401).json({ message: 'Unauthorized' });
+            }
+        }
+
+        const safeBody = checkXSS(req.body) || {};
+        const str = (v) => (typeof v === 'string' ? v.trim() : '');
+        const title = str(safeBody.title);
+        const description = str(safeBody.description);
+        const dateTime = str(safeBody.dateTime);
+        const recipients = str(safeBody.recipients);
+        const roomName = str(safeBody.roomName);
+        const duration = parseInt(safeBody.duration, 10);
+
+        if (!title || !dateTime || !duration || !recipients || !roomName) {
+            return res.status(400).json({ message: 'Missing required fields' });
+        }
+
+        if (!Validator.isValidRoomName(roomName)) {
+            return res.status(400).json({ message: 'Invalid room name' });
+        }
+
+        if (
+            title.length > SCHEDULE_MEETING_LIMITS.titleMax ||
+            description.length > SCHEDULE_MEETING_LIMITS.descriptionMax
+        ) {
+            return res.status(400).json({ message: 'Title or description is too long' });
+        }
+
+        if (!Number.isFinite(duration) || duration < 1 || duration > 24 * 60) {
+            return res.status(400).json({ message: 'Invalid duration' });
+        }
+
+        const scheduleStartDate = new Date(dateTime);
+        if (Number.isNaN(scheduleStartDate.getTime())) {
+            return res.status(400).json({ message: 'Invalid dateTime' });
+        }
+
+        const recipientList = Validator.parseEmailList(recipients);
+
+        if (recipientList.length === 0) {
+            return res.status(400).json({ message: 'No valid email recipients' });
+        }
+
+        if (recipientList.length > scheduleMeetingMaxRecipients) {
+            return res.status(400).json({
+                message: `Too many recipients. Max allowed is ${scheduleMeetingMaxRecipients}`,
+            });
+        }
+
+        if (!Validator.hasAllowedEmailDomains(recipientList, scheduleMeetingAllowedDomains)) {
+            return res.status(400).json({ message: 'One or more recipients are outside allowed domains' });
+        }
+
+        const requesterIp = authHost.getIP(req);
+
+        log.info('scheduleMeeting request', {
+            requester: authState.requester,
+            ip: requesterIp,
+            recipientCount: recipientList.length,
+            title,
+        });
+
+        try {
+            await nodemailer.sendScheduleMeeting({
+                title,
+                description,
+                dateTime: scheduleStartDate.toISOString(),
+                duration,
+                recipients: recipientList,
+                roomName,
+                hostUrl: config.server.hostUrl,
+            });
+
+            log.info('scheduleMeeting invitations sent', {
+                requester: authState.requester,
+                ip: requesterIp,
+                recipientCount: recipientList.length,
+                roomName,
+            });
+
+            res.status(200).json({ message: 'Meeting scheduled and invitations sent' });
+        } catch (err) {
+            log.error('scheduleMeeting', {
+                error: err.message,
+                requester: authState.requester,
+                ip: requesterIp,
+                recipientCount: recipientList.length,
+            });
+            res.status(500).json({ message: 'Failed to send meeting invitations' });
+        }
+    });
+
+    // Handle Direct join room with params
+    app.get('/join/', async (req, res) => {
+        if (Object.keys(req.query).length > 0) {
+            //log.debug('/join/params - hostCfg ----->', hostCfg);
+
+            log.debug('Direct Join', req.query);
+
+            // http://localhost:3010/join?room=test&name=mirotalksfu&audio=0&video=0&screen=0&notify=0&chat=1
+            // http://localhost:3010/join?room=test&roomPassword=0&name=mirotalksfu&audio=1&video=1&screen=0&hide=0&notify=1&duration=00:00:30
+            // http://localhost:3010/join?room=test&roomPassword=0&name=mirotalksfu&audio=1&video=1&screen=0&hide=0&notify=0&token=token
+
+            const { room, roomPassword, name, audio, video, screen, hide, notify, chat, duration, token, isPresenter } =
+                checkXSS(req.query);
+
+            if (!room) {
+                log.warn('/join/params room empty', room);
+                return res.redirect('/');
+            }
+
+            if (!Validator.isValidRoomName(room)) {
+                return res.redirect('/');
+            }
+
+            let peerUsername = '';
+            let peerPassword = '';
+            let isPeerValid = false;
+            let isPeerPresenter = false;
+
+            if (token) {
+                try {
+                    const validToken = await isValidToken(token);
+
+                    if (!validToken) {
+                        return res.status(401).json({ message: 'Invalid Token' });
+                    }
+
+                    const { username, password, presenter } = checkXSS(decodeToken(token));
+
+                    peerUsername = username;
+                    peerPassword = password;
+                    isPeerValid = await isAuthPeer(username, password);
+                    isPeerPresenter = presenter === '1' || presenter === 'true';
+
+                    if (isPeerPresenter && !hostCfg.users_from_db) {
+                        const roomAllowedForUser = await isRoomAllowedForUser('Direct Join with token', username, room);
+                        if (!roomAllowedForUser) {
+                            log.warn('Direct Room Join for this User is Unauthorized', {
+                                username: username,
+                                room: room,
+                            });
+                            return res.redirect('/whoAreYou/' + room);
+                        }
+                    }
+                } catch (err) {
+                    log.error('Direct Join JWT error', { error: err.message, token: token });
+                    return hostCfg.protected || hostCfg.user_auth
+                        ? htmlInjector.injectHtml(views.login, res)
+                        : htmlInjector.injectHtml(views.landing, res);
+                }
+            } else {
+                const allowRoomAccess = isAllowedRoomAccess('/join/params', req, hostCfg, roomList, room);
+                const roomAllowedForUser = await isRoomAllowedForUser('Direct Join without token', name, room);
+
+                log.debug('Direct Room Join no JWT --------------->', {
+                    allowRoomAccess: allowRoomAccess,
+                    roomAllowedForUser: roomAllowedForUser,
+                });
+
+                if (!allowRoomAccess && !roomAllowedForUser) {
+                    log.warn('Direct Room Join Unauthorized', room);
+                    return res.redirect('/whoAreYou/' + room);
+                }
+            }
+
+            const OIDCUserAuthenticated = OIDC.enabled && req.oidc.isAuthenticated();
+
+            if (
+                (hostCfg.protected && isPeerValid && isPeerPresenter && !hostCfg.authenticated) ||
+                OIDCUserAuthenticated
+            ) {
+                const ip = getIP(req);
+                hostCfg.authenticated = true;
+                authHost.setAuthorizedIP(ip, true);
+                log.debug('Direct Join user auth as host done', {
+                    ip: ip,
+                    username: peerUsername,
+                    password: peerPassword,
+                });
+            }
+
+            if (room && (hostCfg.authenticated || isPeerValid)) {
+                return htmlInjector.injectHtml(views.room, res);
+            } else {
+                return htmlInjector.injectHtml(views.login, res);
+            }
+        }
+
+        return res.redirect('/');
+    });
+
+    // join room by id
+    app.get('/join/:roomId', async (req, res) => {
+        //
+        const { roomId } = checkXSS(req.params);
+
+        if (!roomId) {
+            log.warn('/join/:roomId empty', roomId);
+            return res.redirect('/');
+        }
+
+        if (!Validator.isValidRoomName(roomId)) {
+            log.warn('/join/:roomId invalid', roomId);
+            return res.redirect('/');
+        }
+
+        const allowRoomAccess = isAllowedRoomAccess('/join/:roomId', req, hostCfg, roomList, roomId);
+
+        if (allowRoomAccess) {
+            // 1. Protect room access with database check
+            if (!OIDC.enabled && hostCfg.protected && hostCfg.users_from_db) {
+                const roomExists = await roomExistsForUser(roomId);
+                log.debug('/join/:roomId exists from API endpoint', roomExists);
+                return roomExists ? htmlInjector.injectHtml(views.room, res) : res.redirect('/login?room=' + roomId);
+            }
+            // 2. Protect room access with configuration check
+            if (!OIDC.enabled && hostCfg.protected && !hostCfg.users_from_db) {
+                const roomExists = hostCfg.users.some(
+                    (user) => user.allowed_rooms && (user.allowed_rooms.includes(roomId) || roomList.has(roomId))
+                );
+                log.debug('/join/:roomId exists from config allowed rooms', roomExists);
+                return roomExists ? htmlInjector.injectHtml(views.room, res) : res.redirect('/whoAreYou/' + roomId);
+            }
+            htmlInjector.injectHtml(views.room, res);
+        } else {
+            // Who are you? (waiting room)
+            OIDC.enabled || hostCfg.protected ? res.redirect('/whoAreYou/' + roomId) : res.redirect('/');
+        }
+    });
+
+    // not specified correctly the room id
+    app.get('/join/\\*', (req, res) => {
+        res.redirect('/');
+    });
+
+    // if not allow video/audio
+    app.get('/permission', (req, res) => {
+        res.sendFile(views.permission);
+    });
+
+    // privacy policy
+    app.get('/privacy', (req, res) => {
+        res.sendFile(views.privacy);
+    });
+
+    // mirotalk about
+    app.get('/about', (req, res) => {
+        res.sendFile(views.about);
+    });
+
+    // Get stats endpoint
+    app.get('/stats', (req, res) => {
+        const stats = config?.features?.stats || defaultStats;
+        // log.debug('Send stats', stats);
+        res.send(stats);
+    });
+
+    // handle who are you: Presenter or Guest
+    app.get('/whoAreYou/:roomId', (req, res) => {
+        htmlInjector.injectHtml(views.whoAreYou, res);
+    });
+
+    // handle login if user_auth enabled
+    app.get('/login', (req, res) => {
+        if (hostCfg.protected || hostCfg.user_auth) {
+            return htmlInjector.injectHtml(views.login, res);
+        }
+        res.redirect('/');
+    });
+
+    // handle logged on host protected
+    app.get('/logged', (req, res) => {
+        const { room } = checkXSS(req.query);
+        if (!OIDC.enabled && hostCfg.protected) {
+            const ip = getIP(req);
+            if (allowedIP(ip)) {
+                hostCfg.authenticated = true;
+                res.redirect(room ? '/join/' + room : '/');
+            } else {
+                hostCfg.authenticated = false;
+                res.redirect(room ? '/login?room=' + room : '/login');
+            }
+        } else {
+            res.redirect('/');
+        }
+    });
+
+    // ####################################################
+    // AXIOS
+    // ####################################################
+
+    // handle login on host protected
+    app.post('/login', loginLimiter, async (req, res) => {
+        const ip = getIP(req);
+        log.debug(`Request login to host from: ${ip}`, req.body);
+
+        const safeBody = checkXSS(req.body) || {};
+        const { username, password } = safeBody;
+
+        if (!username || !password) {
+            log.warn('Login failed: missing username or password', req.body);
+            return res.status(400).json({ message: 'Missing username or password' });
+        }
+
+        const isPeerValid = await isAuthPeer(username, password);
+
+        if (hostCfg.protected && isPeerValid && !hostCfg.authenticated) {
+            const ip = getIP(req);
+            hostCfg.authenticated = true;
+            authHost.setAuthorizedIP(ip, true);
+            log.debug('HOST LOGIN OK', {
+                ip: ip,
+                authorized: authHost.isAuthorizedIP(ip),
+                authorizedIps: authHost.getAuthorizedIPs(),
+            });
+
+            const isPresenter = Boolean(
+                hostCfg?.presenters?.join_first || hostCfg?.presenters?.list?.includes(username)
+            );
+
+            const user = hostCfg.users.find((user) => user.displayname === username || user.username === username);
+            const token = encodeToken({ username: username, password: password, presenter: isPresenter });
+            const allowedRooms = await getUserAllowedRooms(username, password);
+
+            log.debug('login -------------->', { displayName: user?.displayname || username });
+
+            return res
+                .status(200)
+                .json({ message: token, displayname: user?.displayname || username, allowedRooms: allowedRooms });
+        }
+
+        if (isPeerValid) {
+            log.debug('PEER LOGIN OK', { ip: ip, authorized: true });
+            const isPresenter = hostCfg?.presenters?.list?.includes(username) || false;
+            const token = encodeToken({ username: username, password: password, presenter: isPresenter });
+            const allowedRooms = await getUserAllowedRooms(username, password);
+            return res.status(200).json({ message: token, allowedRooms: allowedRooms });
+        } else {
+            return res.status(401).json({ message: 'unauthorized' });
+        }
+    });
+
+    // ####################################################
+    // RECORDING UTILITY
+    // ####################################################
+
+    function isValidRequest(req, fileName, roomId, durationMs = false, checkContentType = true) {
+        const contentType = req.headers['content-type'];
+        if (checkContentType && contentType !== 'application/octet-stream') {
+            throw new Error('Invalid content type');
+        }
+
+        if (!fileName || sanitizeFilename(fileName) !== fileName || !Validator.isValidRecFileNameFormat(fileName)) {
+            throw new Error('Invalid file name');
+        }
+
+        if (!roomList || typeof roomList.has !== 'function' || !roomList.has(roomId)) {
+            throw new Error('Invalid room ID');
+        }
+
+        if (
+            durationMs &&
+            typeof durationMs !== 'undefined' &&
+            (!Number.isFinite(Number(durationMs)) || Number(durationMs) <= 0)
+        ) {
+            throw new Error('Invalid durationMs');
+        }
+    }
+
+    function getRoomIdFromFilename(fileName) {
+        const parts = fileName.split('_');
+        if (parts.length >= 2) {
+            return parts[1];
+        }
+        throw new Error('Invalid file name format');
+    }
+
+    function deleteFile(filePath) {
+        if (!fs.existsSync(filePath)) return false;
+
+        try {
+            fs.unlinkSync(filePath);
+            log.info(`[Upload] File ${filePath} removed from local after S3 upload`);
+        } catch (err) {
+            log.error(`[Upload] Failed to delete local file ${filePath}`, err.message);
+        }
+    }
+
+    // ####################################################
+    // RECORDING HANDLERS
+    // ####################################################
+
+    async function uploadToS3(filePath, fileName, roomId, bucket, s3Client) {
+        if (!fs.existsSync(filePath)) return false;
+
+        return withFileLock(filePath, async () => {
+            const fileStream = fs.createReadStream(filePath);
+            const key = `recordings/${roomId}/${fileName}`;
+
+            const mimeType = mime.lookup(fileName) || 'application/octet-stream';
+
+            log.debug(`[Upload] Uploading ${fileName}`, { bucket: bucket, key: key, mimeType: mimeType });
+
+            const upload = new Upload({
+                client: s3Client,
+                params: {
+                    Bucket: bucket,
+                    Key: key,
+                    Body: fileStream,
+                    ContentType: mimeType,
+                    Metadata: {
+                        'room-id': roomId,
+                        'file-name': fileName,
+                    },
+                },
+            });
+
+            await upload.done();
+
+            return { success: true, fileName, key };
+        });
+    }
+
+    async function saveLocally(filePath, req, recMaxFileSize) {
+        return withFileLock(filePath, () => {
+            return new Promise((resolve, reject) => {
+                const writeStream = fs.createWriteStream(filePath, { flags: 'a' });
+                let receivedBytes = 0;
+
+                req.on('data', (chunk) => {
+                    receivedBytes += chunk.length;
+                    if (receivedBytes > recMaxFileSize) {
+                        req.destroy();
+                        writeStream.destroy();
+                        return reject(new Error('File size exceeds limit'));
+                    }
+                });
+
+                req.pipe(writeStream);
+
+                writeStream.on('finish', () => resolve({ status: 'file_saved_locally', path: filePath }));
+                writeStream.on('error', reject);
+            });
+        });
+    }
+
+    // ####################################################
+    // RECORDING ROUTE HANDLER
+    // ####################################################
+
+    app.post('/recSync', async (req, res) => {
+        if (!serverRecordingEnabled) {
+            return res.status(403).json({ error: 'Recording disabled' });
+        }
+
+        if (!fs.existsSync(dir.rec)) {
+            fs.mkdirSync(dir.rec, { recursive: true });
+        }
+
+        try {
+            const start = Date.now();
+
+            const { fileName } = checkXSS(req.query);
+            const roomId = getRoomIdFromFilename(fileName);
+
+            isValidRequest(req, fileName, roomId);
+
+            const filePath = path.resolve(dir.rec, fileName);
+            const passThrough = new PassThrough();
+
+            let totalBytes = 0;
+
+            passThrough.on('data', (chunk) => {
+                totalBytes += chunk.length;
+            });
+
+            req.pipe(passThrough);
+
+            const localStream = passThrough.pipe(new PassThrough());
+
+            await saveLocally(filePath, localStream, recMaxFileSize);
+
+            const duration = ((Date.now() - start) / 1000).toFixed(2);
+            const sizeMB = (totalBytes / 1024 / 1024).toFixed(2);
+
+            log.info(`[Upload] Saved ${fileName} (${sizeMB} MB) in ${duration}s`);
+
+            return res.status(200).json({ status: 'upload_complete', fileName });
+        } catch (error) {
+            log.error('Upload error:', error.message);
+
+            if (error.message.includes('exceeds limit')) {
+                res.status(413).json({ error: 'File too large' });
+            } else if (['Invalid content type', 'Invalid file name', 'Invalid room ID'].includes(error.message)) {
+                res.status(400).json({ error: error.message });
+            } else if (error.message.includes('already in progress')) {
+                res.status(429).json({ error: 'Upload already in progress' });
+            } else {
+                res.status(500).json({ error: 'Internal Server Error' });
+            }
+        }
+    });
+
+    app.post('/recSyncFixWebm', async (req, res) => {
+        try {
+            const { fileName, durationMs } = checkXSS(req.query);
+            const roomId = getRoomIdFromFilename(fileName);
+
+            isValidRequest(req, fileName, roomId, durationMs, false);
+
+            const filePath = path.resolve(dir.rec, fileName);
+
+            if (!fs.existsSync(filePath)) {
+                return res.status(404).json({ message: 'File not found' });
+            }
+
+            if (durationMs && fs.existsSync(filePath)) {
+                try {
+                    fixDurationOrRemux(filePath, Number(durationMs));
+                } catch (e) {
+                    console.warn('Finalize fix skipped:', e?.message || e);
+                }
+            }
+
+            return res.status(200).json({ message: 'OK' });
+        } catch (err) {
+            console.error('recSyncFixWebm error', err);
+            return res.status(500).json({ message: 'Internal error' });
+        }
+    });
+
+    app.post('/recSyncFinalize', async (req, res) => {
+        try {
+            const shouldUploadToS3 = config?.integrations?.s3?.enabled && config?.media?.recording?.uploadToS3;
+            if (!shouldUploadToS3 || !serverRecordingEnabled) {
+                return res.status(403).json({ error: 'Recording disabled' });
+            }
+            const start = Date.now();
+
+            const { fileName, durationMs } = checkXSS(req.query);
+            const roomId = getRoomIdFromFilename(fileName);
+
+            isValidRequest(req, fileName, roomId, durationMs, false);
+
+            const filePath = path.resolve(dir.rec, fileName);
+
+            if (!fs.existsSync(filePath)) {
+                return res.status(500).json({ error: 'Rec Finalization failed file not exists' });
+            }
+
+            if (durationMs && fs.existsSync(filePath)) {
+                try {
+                    fixDurationOrRemux(filePath, Number(durationMs));
+                } catch (e) {
+                    log.warn('Finalize fix skipped:', e?.message || e);
+                }
+            }
+
+            const bucket = config?.integrations?.s3?.bucket;
+            const s3 = await uploadToS3(filePath, fileName, roomId, bucket, s3Client);
+
+            const duration = ((Date.now() - start) / 1000).toFixed(2);
+
+            log.info(`[Rec Finalization] done ${fileName} in ${duration}s`, { ...s3 });
+
+            deleteFile(filePath); // Delete local file after successful upload
+
+            return res.status(200).json({ status: 's3_upload_complete', ...s3 });
+        } catch (error) {
+            log.error('Rec Finalization error', error.message);
+            return res.status(500).json({ error: 'Rec Finalization failed' });
+        }
+    });
+
+    // ###############################################################
+    // INCOMING STREAM (getUserMedia || getDisplayMedia) TO RTMP
+    // ###############################################################
+
+    function checkRTMPApiSecret(req, res, next) {
+        const expectedApiSecret = rtmpCfg && rtmpCfg.apiSecret;
+        const apiSecret = req.headers.authorization;
+
+        if (!apiSecret || apiSecret !== expectedApiSecret) {
+            log.warn('RTMP apiSecret Unauthorized', {
+                apiSecret: apiSecret,
+                expectedApiSecret: expectedApiSecret,
+            });
+            return res.status(401).send('Unauthorized');
+        }
+        next();
+    }
+
+    function checkMaxStreams(req, res, next) {
+        const maxStreams = (rtmpCfg && rtmpCfg.maxStreams) || 1;
+        const activeStreams = getRtmpTotalActiveStreamsCount();
+        if (activeStreams >= maxStreams) {
+            log.warn('Maximum number of RTMP streams reached', { activeStreams, maxStreams });
+            return res.status(429).send('Maximum number of streams reached, please try later!');
+        }
+        next();
+    }
+
+    app.get('/activeStreams', checkRTMPApiSecret, (req, res) => {
+        const total = getRtmpTotalActiveStreamsCount();
+        log.info('Active Streams', { total });
+        res.json({ total });
+    });
+
+    app.get('/rtmpEnabled', (req, res) => {
+        log.debug('RTMP enabled', rtmpEnabled);
+        res.json({ enabled: rtmpEnabled });
+    });
+
+    app.post('/initRTMP', checkRTMPApiSecret, checkMaxStreams, (req, res) => {
+        if (!rtmpCfg || !rtmpCfg.enabled) {
+            return res.status(400).send('RTMP server is not enabled or missing the config');
+        }
+
+        const customRtmpUrl = req.body?.customRtmpUrl || null;
+
+        let rtmp;
+        let rtmpStreamKey;
+
+        if (customRtmpUrl && rtmpCfg.allowCustomUrl) {
+            try {
+                const parsed = new URL(customRtmpUrl);
+                if (!['rtmp:', 'rtmps:'].includes(parsed.protocol)) {
+                    return res.status(400).send('Invalid RTMP URL scheme. Only rtmp:// and rtmps:// are allowed');
+                }
+            } catch (err) {
+                return res.status(400).send('Invalid custom RTMP URL');
+            }
+            rtmp = customRtmpUrl;
+            rtmpStreamKey = uuidv4();
+            log.info('initRTMP using custom RTMP URL', { rtmp });
+        } else {
+            const domainName = config?.integrations?.ngrok?.enabled
+                ? 'localhost'
+                : req.headers.host?.split(':')[0] || 'localhost';
+
+            const rtmpUseNodeMediaServer = rtmpCfg.useNodeMediaServer ?? true;
+            const rtmpServer = rtmpCfg.server != '' ? rtmpCfg.server : false;
+            const rtmpServerAppName = rtmpCfg.appName != '' ? rtmpCfg.appName : 'live';
+            rtmpStreamKey = rtmpCfg.streamKey != '' ? rtmpCfg.streamKey : uuidv4();
+            const rtmpServerSecret = rtmpCfg.secret != '' ? rtmpCfg.secret : false;
+            const expirationHours = rtmpCfg.expirationHours || 4;
+            const rtmpServerURL = rtmpServer ? rtmpServer : `rtmp://${domainName}:1935`;
+            const rtmpServerPath = '/' + rtmpServerAppName + '/' + rtmpStreamKey;
+
+            rtmp = rtmpUseNodeMediaServer
+                ? generateRTMPUrl(rtmpServerURL, rtmpServerPath, rtmpServerSecret, expirationHours)
+                : rtmpServerURL + rtmpServerPath;
+
+            log.info('initRTMP', {
+                headers: req.headers,
+                rtmpUseNodeMediaServer: rtmpUseNodeMediaServer,
+                rtmpServer,
+                rtmpServerSecret,
+                rtmpServerURL,
+                rtmpServerPath,
+                expirationHours,
+                rtmpStreamKey,
+                rtmp,
+            });
+        }
+
+        const stream = new RtmpStreamer(rtmp, rtmpStreamKey);
+        stream.lastActivity = Date.now();
+        streams[rtmpStreamKey] = stream;
+
+        log.info('Active RTMP Streams', { total: getRtmpTotalActiveStreamsCount() });
+
+        return res.json({ rtmp, rtmpStreamKey });
+    });
+
+    app.post('/streamRTMP', checkRTMPApiSecret, (req, res) => {
+        if (!rtmpCfg || !rtmpCfg.enabled) {
+            return res.status(400).send('RTMP server is not enabled');
+        }
+        if (!req.body || req.body.length === 0) {
+            return res.status(400).send('Invalid video data');
+        }
+
+        const rtmpStreamKey = req.query.key;
+        const stream = streams[rtmpStreamKey];
+
+        if (!stream || !stream.isRunning()) {
+            delete streams[rtmpStreamKey];
+            log.debug('Stream not found', { rtmpStreamKey, streams: Object.keys(streams).length });
+            return res.status(404).send('FFmpeg Stream not found');
+        }
+
+        log.debug('Received video data', {
+            // data: req.body.slice(0, 20).toString('hex'),
+            key: rtmpStreamKey,
+            size: bytesToSize(req.headers['content-length']),
+        });
+
+        stream.lastActivity = Date.now();
+        stream.write(Buffer.from(req.body));
+        res.sendStatus(200);
+    });
+
+    app.post('/stopRTMP', checkRTMPApiSecret, (req, res) => {
+        if (!rtmpCfg || !rtmpCfg.enabled) {
+            return res.status(400).send('RTMP server is not enabled');
+        }
+
+        const rtmpStreamKey = req.query.key;
+        const stream = streams[rtmpStreamKey];
+
+        if (stream) {
+            stream.end();
+            delete streams[rtmpStreamKey];
+            log.debug('Active RTMP Streams', { total: getRtmpTotalActiveStreamsCount() });
+        }
+
+        res.sendStatus(200);
+    });
+
+    // Cleanup orphaned RTMP streams that haven't received data
+    setInterval(() => {
+        const now = Date.now();
+        for (const [key, stream] of Object.entries(streams)) {
+            if (!stream.isRunning() || (stream.lastActivity && now - stream.lastActivity > STREAM_TIMEOUT_MS)) {
+                log.debug('Cleaning up orphaned RTMP stream', key);
+                stream.end();
+                delete streams[key];
+                log.debug('Active RTMP Streams', { total: getRtmpTotalActiveStreamsCount() });
+            }
+        }
+    }, STREAM_TIMEOUT_MS);
+
+    // Join roomId redirect to /join?room=roomId
+    app.get('/:roomId', (req, res) => {
+        const { roomId } = checkXSS(req.params);
+
+        if (!Validator.isValidRoomName(roomId)) {
+            log.warn('/:roomId not valid', roomId);
+            return res.redirect('/');
+        }
+
+        log.debug(`Detected roomId --> redirect to /join?room=${roomId}`);
+        res.redirect(`/join/${roomId}`);
+    });
+
+    // ####################################################
+    // REST API
+    // ####################################################
+
+    app.get(restApi.basePath + '/stats', (req, res) => {
+        try {
+            // Check if endpoint allowed
+            if (restApi.allowed && !restApi.allowed.stats) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+                });
+            }
+            // check if user was authorized for the api call
+            const { host, authorization } = req.headers;
+            const api = new ServerApi(host, authorization);
+
+            if (!api.isAuthorized()) {
+                log.debug('MiroTalk get meetings - Unauthorized', {
+                    header: req.headers,
+                    body: req.body,
+                });
+                return res.status(403).json({ error: 'Unauthorized!' });
+            }
+
+            const { timestamp, totalRooms, totalUsers } = api.getStats(roomList);
+
+            res.json({
+                success: true,
+                timestamp,
+                totalRooms,
+                totalUsers,
+            });
+
+            // log.debug the output if all done
+            log.debug('MiroTalk get stats - Authorized', {
+                header: req.headers,
+                body: req.body,
+                timestamp,
+                totalRooms,
+                totalUsers,
+            });
+        } catch (error) {
+            console.error('Error fetching stats', error);
+            res.status(500).json({ success: false, error: 'Failed to retrieve stats.' });
+        }
+    });
+
+    // request meetings list
+    app.get(restApi.basePath + '/meetings', (req, res) => {
+        // Check if endpoint allowed
+        if (restApi.allowed && !restApi.allowed.meetings) {
+            return res.status(403).json({
+                error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+            });
+        }
+        // check if user was authorized for the api call
+        const { host, authorization } = req.headers;
+        const api = new ServerApi(host, authorization);
+        if (!api.isAuthorized()) {
+            log.debug('MiroTalk get meetings - Unauthorized', {
+                header: req.headers,
+                body: req.body,
+            });
+            return res.status(403).json({ error: 'Unauthorized!' });
+        }
+        // Get meetings
+        const meetings = api.getMeetings(roomList);
+        res.json({ meetings: meetings });
+        // log.debug the output if all done
+        log.debug('MiroTalk get meetings - Authorized', {
+            header: req.headers,
+            body: req.body,
+            meetings: meetings,
+        });
+    });
+
+    // request meeting room endpoint
+    app.post(restApi.basePath + '/meeting', (req, res) => {
+        // Check if endpoint allowed
+        if (restApi.allowed && !restApi.allowed.meeting) {
+            return res.status(403).json({
+                error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+            });
+        }
+        // check if user was authorized for the api call
+        const { host, authorization } = req.headers;
+        const api = new ServerApi(host, authorization);
+        if (!api.isAuthorized()) {
+            log.debug('MiroTalk get meeting - Unauthorized', {
+                header: req.headers,
+                body: req.body,
+            });
+            return res.status(403).json({ error: 'Unauthorized!' });
+        }
+        // setup meeting URL
+        const meetingURL = api.getMeetingURL();
+        res.json({ meeting: meetingURL });
+        // log.debug the output if all done
+        log.debug('MiroTalk get meeting - Authorized', {
+            header: req.headers,
+            body: req.body,
+            meeting: meetingURL,
+        });
+    });
+
+    // request join room endpoint
+    app.post(restApi.basePath + '/join', (req, res) => {
+        // Check if endpoint allowed
+        if (restApi.allowed && !restApi.allowed.join) {
+            return res.status(403).json({
+                error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+            });
+        }
+        // check if user was authorized for the api call
+        const { host, authorization } = req.headers;
+        const api = new ServerApi(host, authorization);
+        if (!api.isAuthorized()) {
+            log.debug('MiroTalk get join - Unauthorized', {
+                header: req.headers,
+                body: req.body,
+            });
+            return res.status(403).json({ error: 'Unauthorized!' });
+        }
+        // setup Join URL
+        const joinURL = api.getJoinURL(req.body);
+        res.json({ join: joinURL });
+        // log.debug the output if all done
+        log.debug('MiroTalk get join - Authorized', {
+            header: req.headers,
+            body: req.body,
+            join: joinURL,
+        });
+    });
+
+    // request token endpoint
+    app.post(restApi.basePath + '/token', (req, res) => {
+        // Check if endpoint allowed
+        if (restApi.allowed && !restApi.allowed.token) {
+            return res.status(403).json({
+                error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+            });
+        }
+        // check if user was authorized for the api call
+        const { host, authorization } = req.headers;
+        const api = new ServerApi(host, authorization);
+        if (!api.isAuthorized()) {
+            log.debug('MiroTalk get token - Unauthorized', {
+                header: req.headers,
+                body: req.body,
+            });
+            return res.status(403).json({ error: 'Unauthorized!' });
+        }
+        // Get Token
+        const token = api.getToken(req.body);
+        res.json({ token: token });
+        // log.debug the output if all done
+        log.debug('MiroTalk get token - Authorized', {
+            header: req.headers,
+            body: req.body,
+            token: token,
+        });
+    });
+
+    // request end meeting room endpoint
+    app.delete(restApi.basePath + '/meeting/:room', (req, res) => {
+        try {
+            // Check if endpoint allowed
+            if (restApi.allowed && !restApi.allowed.meetingEnd) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+                });
+            }
+            // check if user was authorized for the api call
+            const { host, authorization } = req.headers;
+            const api = new ServerApi(host, authorization);
+            if (!api.isAuthorized()) {
+                log.debug('MiroTalk end meeting - Unauthorized', {
+                    header: req.headers,
+                    body: req.body,
+                });
+                return res.status(403).json({ error: 'Unauthorized!' });
+            }
+            // End the meeting
+            const { room } = req.params;
+            const { redirect } = req.body || {};
+            const result = api.endMeeting(roomList, room, redirect);
+            const status = result.success ? 200 : 404;
+            res.status(status).json(result);
+            // log.debug the output if all done
+            log.debug('MiroTalk end meeting - Authorized', {
+                header: req.headers,
+                room: room,
+                result: result,
+            });
+        } catch (error) {
+            console.error('Error ending meeting', error);
+            res.status(500).json({ success: false, error: 'Failed to end meeting.' });
+        }
+    });
+
+    // ####################################################
+    // SLACK API
+    // ####################################################
+
+    app.post('/slack', (req, res) => {
+        if (!slackEnabled) return res.end('`Under maintenance` - Please check back soon.');
+
+        if (restApi.allowed && !restApi.allowed.slack) {
+            return res.end(
+                '`This endpoint has been disabled`. Please contact the administrator for further information.'
+            );
+        }
+
+        log.debug('Slack', req.headers);
+
+        if (!slackSigningSecret) return res.end('`Slack Signing Secret is empty!`');
+
+        const slackSignature = req.headers['x-slack-signature'];
+        const requestBody = qS.stringify(req.body, { format: 'RFC1738' });
+        const timeStamp = req.headers['x-slack-request-timestamp'];
+        const time = Math.floor(new Date().getTime() / 1000);
+
+        if (Math.abs(time - timeStamp) > 300) return res.end('`Wrong timestamp` - Ignore this request.');
+
+        const sigBaseString = 'v0:' + timeStamp + ':' + requestBody;
+        const mySignature = 'v0=' + CryptoJS.HmacSHA256(sigBaseString, slackSigningSecret);
+
+        if (mySignature == slackSignature) {
+            const host = req.headers.host;
+            const api = new ServerApi(host);
+            const meetingURL = api.getMeetingURL();
+            log.debug('Slack', { meeting: meetingURL });
+            return res.end(meetingURL);
+        }
+        return res.end('`Wrong signature` - Verification failed!');
+    });
+
+    // ####################################################
+    // AUTHORIZED API IF ALLOWED
+    // ####################################################
+
+    // request active rooms endpoint
+    app.get(restApi.basePath + '/activeRooms', activeRoomsLimiter, (req, res) => {
+        // Check if endpoint allowed
+        if (!config.ui?.rooms?.showActive) {
+            return res.status(403).json({
+                error: 'This endpoint has been disabled. Please contact the administrator for further information.',
+            });
+        }
+        // check if user was authorized for the api call
+        const { host, authorization = config.api.keySecret } = req.headers;
+        const api = new ServerApi(host, authorization);
+
+        // Get active rooms
+        const activeRooms = api.getActiveRooms(roomList);
+        res.json({ activeRooms: activeRooms });
+
+        // log.debug the output if all done
+        log.debug('MiroTalk get active rooms - Authorized', {
+            header: req.headers,
+            body: req.body,
+            activeRooms: activeRooms,
+        });
+    });
+
+    // not match any of page before, so 404 not found
+    app.use((req, res) => {
+        res.sendFile(views.notFound);
+    });
+
+    // Global error handler for URIError and other errors
+    app.use((err, req, res, next) => {
+        if (err instanceof URIError) {
+            log.warn('Malformed URI detected', {
+                url: req.url,
+                ip: getIP(req),
+                error: err.message,
+            });
+            return res.status(400).send({ status: 400, message: 'Invalid URL encoding' });
+        }
+        // Handle other errors
+        log.error('Unhandled error', {
+            url: req.url,
+            error: err.message,
+            stack: err.stack,
+        });
+        res.status(500).send({ status: 500, message: 'Internal server error' });
+    });
+
+    // ####################################################
+    // SERVER CONFIG
+    // ####################################################
+
+    function getServerConfig(tunnel = false) {
+        const safeConfig = {
+            // Network & Connectivity
+            network: {
+                server_listen: host,
+                server_tunnel: tunnel,
+                trust_proxy: trustProxy,
+                sfu: {
+                    announcedIP: announcedAddress,
+                    listenIP: IP,
+                    numWorker: config.mediasoup?.numWorkers,
+                    rtcMinPort: config.mediasoup?.worker?.rtcMinPort,
+                    rtcMaxPort: config.mediasoup?.worker?.rtcMaxPort,
+                },
+                ngrok_enabled: config.ngrok?.enabled ? config.ngrok : false,
+            },
+
+            // Security & Authentication
+            security: {
+                cors: corsOptions,
+                embed: {
+                    allowedOrigins: embedAllowedOrigins.length ? embedAllowedOrigins : 'any',
+                    csp: embedCsp ? embedCsp.csp : 'not set (embedding allowed from any origin)',
+                },
+                jwtCfg: jwtCfg,
+                host: hostCfg?.protected || hostCfg?.user_auth ? hostCfg : { presenters: hostCfg.presenters },
+                ip_lookup: config.integrations?.IPLookup?.enabled ? config.integrations.IPLookup : false,
+                oidc: OIDC?.enabled ? OIDC : false,
+                middleware: {
+                    IpWhitelist: config?.security?.middleware?.IpWhitelist?.enabled
+                        ? config.security.middleware.IpWhitelist
+                        : false,
+                    //...
+                },
+            },
+
+            // API & Services
+            api: {
+                rest_api: restApi,
+                webhook: webhook.enabled ? webhook : false,
+            },
+
+            // Media Configuration
+            media: {
+                mediasoup: {
+                    listenInfos: config.mediasoup?.webRtcTransport?.listenInfos,
+                    worker_bin: mediasoup?.workerBin,
+                },
+                rtmp: rtmpCfg?.enabled ? rtmpCfg : false,
+                videoAI: config.integrations?.videoAI?.enabled ? config.integrations.videoAI : false,
+                server_recording: config?.media?.recording?.enabled ? config.media.recording : false,
+            },
+
+            // Communication Integrations
+            integrations: {
+                discord: config.integrations?.discord?.enabled ? config.integrations.discord : false,
+                mattermost: config.integrations?.mattermost?.enabled ? config.integrations.mattermost : false,
+                slack: slackEnabled ? config.integrations?.slack : false,
+                chatGPT: config.integrations?.chatGPT?.enabled ? config.integrations.chatGPT : false,
+                deepSeek: config.integrations?.deepSeek?.enabled ? config.integrations.deepSeek : false,
+                email_alerts: config?.integrations?.email?.alert ? config.integrations.email : false,
+            },
+
+            // UI & Branding
+            ui: {
+                brand: config.ui?.brand,
+                buttons: config.ui?.buttons,
+            },
+
+            // Monitoring & Analytics
+            monitoring: {
+                sentry: sentryEnabled ? config.integrations?.sentry : false,
+                stats: config.features?.stats?.enabled ? config.features.stats : false,
+                system_info: config.system?.info,
+            },
+
+            // Features & Functionality
+            features: {
+                survey: config.features?.survey?.enabled ? config.features.survey : false,
+                redirect: config.features?.redirect?.enabled ? config.features.redirect : false,
+            },
+
+            // Global Moderation & Management
+            moderation: {
+                room: {
+                    maxParticipants: config?.moderation?.room?.maxParticipants || 1000,
+                    lobby: config?.moderation?.room?.lobby || false,
+                },
+            },
+
+            // Version Information
+            versions: {
+                app: packageJson?.version,
+                node: process.versions.node,
+                server_version: mediasoup?.version,
+                client_version: mediasoupClient?.version,
+            },
+        };
+
+        return safeConfig;
+    }
+
+    // ####################################################
+    // NGROK
+    // ####################################################
+
+    async function ngrokStart() {
+        try {
+            await ngrok.authtoken(config?.integrations?.ngrok?.authToken);
+            const listener = await ngrok.forward({ addr: config?.server?.listen?.port });
+            const tunnelUrl = listener.url();
+            log.info('Server config', getServerConfig(tunnelUrl));
+        } catch (err) {
+            log.warn('Ngrok Start error', err);
+            await ngrok.kill();
+            process.exit(1);
+        }
+    }
+
+    // ####################################################
+    // HANDLE SERVER CLIENT ERRORS
+    // ####################################################
+
+    server.on('clientError', (err, socket) => {
+        if (socket.writable) {
+            socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        }
+        socket.destroy();
+        log.warn('Client connection error', { error: err.message, code: err.code });
+    });
+
+    // ####################################################
+    // START SERVER
+    // ####################################################
+
+    server.listen(config?.server?.listen?.port || 3010, () => {
+        log.log(
+            `%c
+    
+        ███████╗██╗ ██████╗ ███╗   ██╗      ███████╗███████╗██████╗ ██╗   ██╗███████╗██████╗ 
+        ██╔════╝██║██╔════╝ ████╗  ██║      ██╔════╝██╔════╝██╔══██╗██║   ██║██╔════╝██╔══██╗
+        ███████╗██║██║  ███╗██╔██╗ ██║█████╗███████╗█████╗  ██████╔╝██║   ██║█████╗  ██████╔╝
+        ╚════██║██║██║   ██║██║╚██╗██║╚════╝╚════██║██╔══╝  ██╔══██╗╚██╗ ██╔╝██╔══╝  ██╔══██╗
+        ███████║██║╚██████╔╝██║ ╚████║      ███████║███████╗██║  ██║ ╚████╔╝ ███████╗██║  ██║
+        ╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝      ╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═╝ started...
+    
+        `,
+            'font-family:monospace'
+        );
+
+        if (config?.integrations?.ngrok?.enabled && config?.integrations?.ngrok?.authToken !== '') {
+            return ngrokStart();
+        }
+        log.info('Server config', getServerConfig());
+
+        // Warn if default secrets are still in use
+        if (config.api?.keySecret === 'mirotalksfu_default_secret') {
+            log.warn('WARNING: API_KEY_SECRET is set to the default value. Change it before deploying!');
+        }
+        if (jwtCfg.JWT_KEY === 'mirotalksfu_jwt_secret') {
+            log.warn('WARNING: JWT_SECRET is set to the default value. Change it before deploying!');
+        }
+    });
+
+    // ####################################################
+    // WORKERS
+    // ####################################################
+
+    (async () => {
+        try {
+            await createWorkers();
+        } catch (err) {
+            log.error('Create Worker ERROR --->', err);
+            process.exit(1);
+        }
+    })();
+
+    async function createWorkers() {
+        const { numWorkers } = config.mediasoup;
+
+        const { logLevel, logTags, rtcMinPort, rtcMaxPort, disableLiburing } = config.mediasoup.worker;
+
+        log.info('WORKERS:', numWorkers);
+
+        for (let i = 0; i < numWorkers; i++) {
+            //
+            const worker = await mediasoup.createWorker({
+                logLevel: logLevel,
+                logTags: logTags,
+                rtcMinPort: Number(rtcMinPort),
+                rtcMaxPort: Number(rtcMaxPort),
+                disableLiburing: Boolean(disableLiburing),
+            });
+
+            if (webRtcServerActive) {
+                const webRtcServerOptions = clone(config.mediasoup.webRtcServerOptions);
+                const portIncrement = i;
+
+                for (const listenInfo of webRtcServerOptions.listenInfos) {
+                    if (!listenInfo.portRange) {
+                        listenInfo.port += portIncrement;
+                    }
+                }
+
+                log.info('Create a WebRtcServer', {
+                    worker_pid: worker.pid,
+                    webRtcServerOptions: webRtcServerOptions,
+                });
+
+                const webRtcServer = await worker.createWebRtcServer(webRtcServerOptions);
+                worker.appData.webRtcServer = webRtcServer;
+            }
+
+            worker.on('died', () => {
+                log.error('Mediasoup worker died, exiting in 5 seconds...', worker.pid);
+
+                nodemailer.sendEmailAlert('alert', {
+                    subject: 'Worker Died',
+                    body: `The Worker with PID ${worker.pid} has died unexpectedly!`,
+                });
+
+                setTimeout(() => process.exit(1), 5000);
+            });
+
+            workers.push(worker);
+
+            /*
+            setInterval(async () => {
+                const usage = await worker.getResourceUsage();
+                log.debug('mediasoup Worker resource usage', { worker_pid: worker.pid, usage: usage });
+                const dump = await worker.dump();
+                log.debug('mediasoup Worker dump', { worker_pid: worker.pid, dump: dump });
+            }, 120000);
+            */
+        }
+    }
+
+    async function getMediasoupWorker() {
+        const worker = workers[nextMediasoupWorkerIdx];
+        if (++nextMediasoupWorkerIdx === workers.length) nextMediasoupWorkerIdx = 0;
+        return worker;
+    }
+
+    // ####################################################
+    // SOCKET IO
+    // ####################################################
+
+    io.on('connection', (socket) => {
+        socket.on('clientError', (error) => {
+            try {
+                log.error('Client error', error.message);
+                socket.disconnect(true); // true indicates a forced disconnection
+            } catch (error) {
+                log.error('Error handling Client error', error.message);
+            }
+        });
+
+        socket.on('error', (error) => {
+            try {
+                log.error('Socket error', error.message);
+                socket.disconnect(true); // true indicates a forced disconnection
+            } catch (error) {
+                log.error('Error handling socket error', error.message);
+            }
+        });
+
+        socket.on('createRoom', async ({ room_id }, callback) => {
+            // Security: reject invalid room ids (XSS / path traversal / empty).
+            if (!Validator.isValidRoomName(room_id)) {
+                log.warn('[createRoom] - Invalid room name', { room_id });
+                return callback({ error: 'invalid room name' });
+            }
+
+            // Security: per-IP rate limit to prevent roomList spam/enumeration.
+            const ip = getIpSocket(socket);
+            if (!checkCreateRoomLimit(ip)) {
+                log.warn('[createRoom] - Rate limit exceeded', { ip, room_id });
+                return callback({
+                    error: `Too many room creation requests. Please try again after ${minutesLabel(createRoomLimiterMinutes)}.`,
+                });
+            }
+
+            socket.room_id = room_id;
+
+            if (roomList.has(socket.room_id)) {
+                callback({ error: 'already exists' });
+            } else {
+                log.debug('Created room', { room_id: socket.room_id });
+                const worker = await getMediasoupWorker();
+                roomList.set(socket.room_id, new Room(socket.room_id, worker, io));
+                callback({ room_id: socket.room_id });
+            }
+        });
+
+        socket.on('join', async (dataObject, cb) => {
+            if (!roomExists(socket)) {
+                return cb({
+                    error: 'Room does not exist',
+                });
+            }
+
+            // Get peer IPv4 (::1 Its the loopback address in ipv6, equal to 127.0.0.1 in ipv4)
+            const peer_ip = getIpSocket(socket);
+
+            // Get peer Geo Location
+            if (config?.integrations?.IPLookup?.enabled && peer_ip != '::1') {
+                dataObject.peer_geo = await getPeerGeoLocation(peer_ip);
+            }
+
+            const data = checkXSS(dataObject);
+
+            log.debug('User joined', data);
+
+            if (!Validator.isValidRoomName(socket.room_id)) {
+                log.warn('[Join] - Invalid room name', socket.room_id);
+                return cb('invalid');
+            }
+
+            const room = getRoom(socket);
+
+            const {
+                peer_name,
+                peer_id,
+                peer_uuid,
+                peer_token,
+                peer_presenter,
+                os_name,
+                os_version,
+                browser_name,
+                browser_version,
+            } = data.peer_info;
+
+            let is_presenter = peer_presenter;
+
+            // User Auth required or detect token, we check if peer valid
+            if (hostCfg.user_auth || peer_token) {
+                // Check JWT
+                if (peer_token) {
+                    try {
+                        const validToken = await isValidToken(peer_token);
+
+                        if (!validToken) {
+                            log.warn('[Join] - Invalid token', peer_token);
+                            return cb('unauthorized');
+                        }
+
+                        const { username, password, presenter } = checkXSS(decodeToken(peer_token));
+
+                        const isPeerValid = await isAuthPeer(username, password);
+
+                        if (!isPeerValid) {
+                            // redirect peer to login page
+                            log.warn('[Join] - Invalid peer not authenticated', isPeerValid);
+                            return cb('unauthorized');
+                        }
+
+                        const tokenPresenter = presenter === '1' || presenter === 'true';
+
+                        /*
+                            In breakout rooms: only presenters.list members get presenter role
+                            join_first and token-based presenter flags are ignored
+                        */
+                        if (socket.room_id.includes('_breakout_')) {
+                            is_presenter = hostCfg?.presenters?.list?.includes(peer_name) || false;
+                        } else {
+                            is_presenter =
+                                tokenPresenter || (hostCfg?.presenters?.join_first && room?.getPeersCount() === 0);
+                        }
+
+                        log.debug('[Join] - HOST PROTECTED - USER AUTH check peer', {
+                            ip: peer_ip,
+                            peer_username: username,
+                            peer_password: password,
+                            peer_valid: isPeerValid,
+                            peer_presenter: is_presenter,
+                        });
+                    } catch (err) {
+                        log.error('[Join] - JWT error', {
+                            error: err.message,
+                            token: peer_token,
+                        });
+                        return cb('unauthorized');
+                    }
+                } else {
+                    if (!hostCfg.users_from_db) return cb('unauthorized');
+                }
+
+                if (!hostCfg.users_from_db) {
+                    const roomAllowedForUser = isRoomAllowedForUser('[Join]', peer_name, room.id);
+                    if (!roomAllowedForUser) {
+                        log.warn('[Join] - Room not allowed for this peer', { peer_name, room_id: room.id });
+                        return cb('notAllowed');
+                    }
+                }
+            }
+
+            // check if banned...
+            if (room.isBanned(peer_uuid)) {
+                log.debug('[Join] - peer is banned!', {
+                    room_id: data.room_id,
+                    peer: {
+                        name: peer_name,
+                        uuid: peer_uuid,
+                        os_name: os_name,
+                        os_version: os_version,
+                        browser_name: browser_name,
+                        browser_version: browser_version,
+                    },
+                });
+                return cb('isBanned');
+            }
+
+            // Remove old peer with same socket.id before adding new one
+            const existingPeer = room.getPeer(socket.id);
+            if (existingPeer) {
+                room.removePeer(socket.id);
+            }
+
+            room.addPeer(new Peer(socket.id, data));
+
+            const activeRooms = getActiveRooms();
+
+            log.debug('[Join] - current active rooms', activeRooms);
+
+            const activeStreams = getRTMPActiveStreams();
+
+            log.debug('[Join] - current active RTMP streams', activeStreams);
+
+            if (!(socket.room_id in presenters)) presenters[socket.room_id] = {};
+
+            // Set the presenters
+            const presenter = {
+                peer_ip: peer_ip,
+                peer_name: peer_name,
+                peer_uuid: peer_uuid,
+                is_presenter: is_presenter,
+            };
+
+            /**
+             * first we check if the username match the presenters username else if join_first enabled
+             * For breakout rooms, skip join_first rule - only presenters.list or token-based presenters are valid
+             */
+            const isBreakoutRoom = socket.room_id.includes('_breakout_');
+            if (
+                hostCfg?.presenters?.list?.includes(peer_name) ||
+                (!isBreakoutRoom &&
+                    hostCfg?.presenters?.join_first &&
+                    Object.keys(presenters[socket.room_id]).length === 0) ||
+                (peer_token && is_presenter)
+            ) {
+                presenter.is_presenter = true;
+                presenters[socket.room_id][socket.id] = presenter;
+            }
+
+            log.debug('[Join] - Connected presenters grp by roomId', presenters);
+
+            const isPresenter = peer_token
+                ? is_presenter
+                : isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+
+            const peer = room.getPeer(socket.id);
+
+            if (!peer) {
+                return cb({
+                    error: 'Peer does not exist in the room',
+                });
+            }
+
+            log.debug('[Join] - Is Peer presenter', {
+                roomId: socket.room_id,
+                peer_name: peer_name,
+                peer_presenter: isPresenter,
+            });
+
+            peer.updatePeerInfo({ type: 'presenter', status: isPresenter });
+
+            if (room.isLocked() && !isPresenter) {
+                log.debug('The user was rejected because the room is locked, and they are not a presenter');
+                return cb('isLocked');
+            }
+
+            if ((room.isLobbyEnabled() || room.isGlobalLobbyEnabled()) && !isPresenter) {
+                log.debug(
+                    'The user is currently waiting to join the room because the lobby is enabled, and they are not a presenter'
+                );
+                peer.updatePeerInfo({ type: 'lobby', status: true });
+                room.broadCast(socket.id, 'roomLobby', {
+                    peer_id: peer_id,
+                    peer_name: peer_name,
+                    lobby_status: 'waiting',
+                });
+                return cb('isLobby');
+            }
+
+            if ((hostCfg.protected || hostCfg.user_auth) && isPresenter && !hostCfg.users_from_db) {
+                const roomAllowedForUser = isRoomAllowedForUser('[Join]', peer_name, room.id);
+                if (!roomAllowedForUser) {
+                    log.warn('[Join] - Room not allowed for this peer', { peer_name, room_id: room.id });
+                    return cb('notAllowed');
+                }
+            }
+
+            // Email body payload
+            const emailPayload = {
+                room_id: room.id,
+                peer_name: peer_name,
+                domain: socket.handshake.headers.host.split(':')[0],
+                os: os_name ? `${os_name} ${os_version}` : '',
+                browser: browser_name ? `${browser_name} ${browser_version}` : '',
+            };
+
+            const firstJoin = room.getPeersCount() === 1;
+            const guestJoin = room.getPeersCount() === 2;
+
+            // SCENARIO: Notify when the first user join room and is awaiting assistance (global email alert)
+            if (firstJoin && !widget.alert.enabled) {
+                nodemailer.sendEmailAlert('join', emailPayload);
+            }
+
+            // SCENARIO: Notify when the first guest user join room and presenter in (room email notification)
+            if (guestJoin) {
+                const notifications = room.getRoomNotifications();
+                log.debug('Room notifications on guest join', { notifications: notifications });
+                if (notifications?.mode?.email && notifications?.events?.join) {
+                    nodemailer.sendEmailNotifications('join', emailPayload, notifications);
+                }
+            }
+
+            // SCENARIO: Notify when a user joins the widget room for expert assistance
+            if (firstJoin && widget.enabled && widget.alert && widget.alert.enabled && widget.roomId === room.id) {
+                switch (widget.alert.type) {
+                    case 'email':
+                        nodemailer.sendEmailAlert('widget', emailPayload);
+                        break;
+                    // case slack, discord, webhook, ...
+                    default:
+                        log.warn('Unknown alert type for widget', { type: widget.type });
+                }
+            }
+
+            handleJoinWebHook(room.id, data.peer_info);
+
+            // Notify main room when a peer joins a breakout room
+            if (socket.room_id.includes('_breakout_')) {
+                notifyMainRoomBreakoutCountChanged(socket.room_id);
+            }
+
+            cb(room.toJson());
+        });
+
+        socket.on('getRouterRtpCapabilities', (_, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            log.debug('Request: getRouterRtpCapabilities', peerInfo);
+
+            try {
+                const rtpCapabilities = room.getRtpCapabilities();
+                callback(rtpCapabilities);
+            } catch (err) {
+                log.error('Failed to get Router RTP Capabilities', {
+                    error: err.message,
+                    peerInfo,
+                });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('createWebRtcTransport', async (_, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            log.debug('Create WebRTC transport request received', peerInfo);
+
+            try {
+                const createWebRtcTransport = await room.createWebRtcTransport(socket.id);
+                callback(createWebRtcTransport);
+            } catch (err) {
+                log.warn('Create WebRTC Transport warning', { error: err.message, peerInfo });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('connectTransport', async ({ transport_id, dtlsParameters }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            log.debug('Connect transport request received', { transport_id, peerInfo });
+
+            try {
+                const connectTransport = await room.connectPeerTransport(socket.id, transport_id, dtlsParameters);
+                callback(connectTransport);
+            } catch (err) {
+                log.warn('Connect transport warning', { error: err.message, peerInfo });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('restartIce', async ({ transport_id }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const peer = getPeer(socket);
+
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            log.debug('Restart ICE request received', { transport_id: transport_id, peerInfo });
+
+            try {
+                const transport = peer.getTransport(transport_id);
+
+                if (!transport) {
+                    log.warn(`Restart ICE attempt failed. Transport with ID "${transport_id}" not found.`);
+                    return callback({ error: `Transport with id "${transport_id}" not found` });
+                }
+
+                const iceParameters = await transport.restartIce();
+
+                log.debug('ICE Restart successful', { transport_id: transport_id, iceParameters });
+
+                callback(iceParameters);
+            } catch (err) {
+                log.warn('Restart ICE warning', { error: err.message, peerInfo });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('produce', async ({ producerTransportId, kind, appData, rtpParameters }, callback, errback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            const data = {
+                room_id: room.id,
+                peer_name: peerInfo.peer_name,
+                peer_id: socket.id,
+                kind: kind,
+                type: appData.mediaType,
+                status: true,
+            };
+
+            peer.updatePeerInfo(data);
+
+            try {
+                const producer_id = await room.produce(
+                    socket.id,
+                    producerTransportId,
+                    rtpParameters,
+                    kind,
+                    appData.mediaType
+                );
+
+                log.debug('Produce', {
+                    kind: kind,
+                    type: appData.mediaType,
+                    producer_id: producer_id,
+                    peer_id: socket.id,
+                    peerInfo: peerInfo,
+                });
+
+                // add & monitor producer audio level and dominant speaker
+                if (kind === 'audio') {
+                    room.addProducerToAudioLevelObserver({ producerId: producer_id });
+                    room.addProducerToActiveSpeakerObserver({ producerId: producer_id });
+                }
+
+                callback({ producer_id });
+            } catch (err) {
+                log.warn('Producer transport error', {
+                    error: err,
+                    peerInfo,
+                });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('consume', async ({ consumerTransportId, producerId, rtpCapabilities, type }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                const params = await room.consume(socket.id, consumerTransportId, producerId, rtpCapabilities, type);
+
+                log.debug('Consuming', {
+                    producer_type: type,
+                    producer_id: producerId,
+                    consumer_id: params ? params.id : undefined,
+                    peerInfo: peerInfo,
+                });
+
+                callback(params);
+            } catch (err) {
+                log.warn('Consumer transport error', {
+                    error: err,
+                    type,
+                    consumerTransportId,
+                    producerId,
+                    rtpCapabilities,
+                    peerInfo,
+                });
+                callback({ error: err.message });
+            }
+        });
+
+        // ####################################################
+        // DATA CHANNEL (DataProducer / DataConsumer)
+        // ####################################################
+
+        socket.on('produceData', async ({ transportId, sctpStreamParameters, label, protocol, appData }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                const dataProducerId = await room.produceData(
+                    socket.id,
+                    transportId,
+                    sctpStreamParameters,
+                    label,
+                    protocol,
+                    appData
+                );
+
+                log.debug('ProduceData', {
+                    dataProducer_id: dataProducerId,
+                    peer_id: socket.id,
+                    label: label,
+                    peerInfo: peerInfo,
+                });
+
+                callback({ id: dataProducerId });
+            } catch (err) {
+                log.warn('ProduceData error', {
+                    error: err.message,
+                    peerInfo,
+                });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('consumeData', async ({ consumerTransportId, dataProducerId }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (!peer) {
+                return callback({ error: 'Peer not found' });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                const params = await room.consumeData(socket.id, consumerTransportId, dataProducerId);
+
+                log.debug('ConsumeData', {
+                    dataProducer_id: dataProducerId,
+                    dataConsumer_id: params ? params.id : undefined,
+                    peerInfo: peerInfo,
+                });
+
+                callback(params);
+            } catch (err) {
+                log.warn('ConsumeData error', {
+                    error: err.message,
+                    consumerTransportId,
+                    dataProducerId,
+                    peerInfo,
+                });
+                callback({ error: err.message });
+            }
+        });
+
+        socket.on('getDataProducers', () => {
+            if (!roomExists(socket)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) return;
+
+            const peerInfo = getPeerInfo(peer);
+
+            log.debug('Get Data Producers', peerInfo);
+
+            const dataProducerList = room.getDataProducerListForPeer(socket.id);
+
+            // Notify the requesting peer about existing data producers
+            for (const dataProducerInfo of dataProducerList) {
+                socket.emit('newDataProducer', dataProducerInfo);
+            }
+        });
+
+        socket.on('producerClosed', (data) => {
+            if (!roomExists(socket)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) return;
+
+            const peerInfo = getPeerInfo(peer);
+
+            if (peer) peer.updatePeerInfo(data); // peer_info.audio OR video OFF
+
+            try {
+                room.closeProducer(socket.id, data.producer_id);
+            } catch (err) {
+                log.warn('Producer Close error', {
+                    error: err.message,
+                    peerInfo,
+                });
+            }
+        });
+
+        socket.on('pauseProducer', async ({ producer_id, type }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const peer = getPeer(socket);
+
+            if (!peer) {
+                return callback({
+                    error: `Peer with ID: ${socket.id} for producer with id "${producer_id}" type "${type}" not found`,
+                });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const producer = peer.getProducer(producer_id);
+
+            if (!producer) {
+                return callback({ error: `Producer with id "${producer_id}" type "${type}" not found` });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                await producer.pause();
+
+                log.debug('Producer paused', { producer_id, type, peerInfo });
+
+                callback('successfully');
+            } catch (error) {
+                log.warn('Pause producer', {
+                    error: error,
+                    peerInfo,
+                });
+                callback({ error: error.message });
+            }
+        });
+
+        socket.on('resumeProducer', async ({ producer_id, type }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const peer = getPeer(socket);
+
+            if (!peer) {
+                return callback({
+                    error: `peer with ID: "${socket.id}" for producer with id "${producer_id}" type "${type}" not found`,
+                });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const producer = peer.getProducer(producer_id);
+
+            if (!producer) {
+                return callback({ error: `producer with id "${producer_id}" type "${type}" not found` });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                await producer.resume();
+
+                log.debug('Producer resumed', { producer_id, type, peerInfo });
+
+                callback('successfully');
+            } catch (error) {
+                log.warn('Resume producer', {
+                    error: error,
+                    peerInfo,
+                });
+                callback({ error: error.message });
+            }
+        });
+
+        socket.on('resumeConsumer', async ({ consumer_id, type }, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const peer = getPeer(socket);
+
+            if (!peer) {
+                return callback({
+                    error: `peer with ID: "${socket.id}" for consumer with id "${consumer_id}" type "${type}" not found`,
+                });
+            }
+
+            if (isPeerInLobby(peer)) {
+                return callback({ error: 'In lobby' });
+            }
+
+            const consumer = peer.getConsumer(consumer_id);
+
+            if (!consumer) {
+                return callback({ error: `consumer with id "${consumer_id}" type "${type}" not found` });
+            }
+
+            const peerInfo = getPeerInfo(peer);
+
+            try {
+                await consumer.resume();
+
+                log.debug('Consumer resumed', { consumer_id, type, peerInfo });
+
+                callback('successfully');
+            } catch (error) {
+                log.warn('Resume consumer', {
+                    error: error,
+                    peerInfo,
+                });
+                callback({ error: error.message });
+            }
+        });
+
+        socket.on('getProducers', () => {
+            if (!roomExists(socket)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (isPeerInLobby(peer)) return;
+
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Get producers', peer_name);
+
+            // send all the current producer to newly joined member (excluding own producers)
+            const producerList = room.getProducerListForPeer(socket.id);
+
+            socket.emit('newProducers', producerList);
+        });
+
+        socket.on('getPeerCounts', async ({}, callback) => {
+            if (!roomExists(socket)) {
+                return callback({ error: 'Room not found' });
+            }
+
+            const room = getRoom(socket);
+
+            const peerCounts = room.getPeersCount();
+
+            log.debug('Peer counts', { peerCounts: peerCounts });
+
+            callback({ peerCounts: peerCounts });
+        });
+
+        socket.on('cmd', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('cmd', data);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            const peer = getPeer(socket);
+
+            if (!room || !peer) return;
+
+            switch (data.type) {
+                case 'privacy':
+                    peer.updatePeerInfo({ type: data.type, status: data.active });
+                    break;
+                case 'ejectAll':
+                    const { peer_name, peer_uuid } = data;
+                    const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+                    if (!isPresenter) return;
+                    break;
+                case 'peerAudio':
+                    // Keep producer volume to update consumer on join room...
+                    if (data.audioProducerId) {
+                        peer.updatePeerInfo({ type: data.type, volume: data.volume * 100 });
+                    }
+                    break;
+                default:
+                    break;
+                //...
+            }
+
+            data.broadcast ? room.broadCast(socket.id, 'cmd', data) : room.sendTo(data.peer_id, 'cmd', data);
+        });
+
+        socket.on('roomAction', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) {
+                log.warn('Room action invalid data', { peer_id: socket.id, room_id: socket.room_id });
+                return;
+            }
+
+            log.debug('Room action:', data);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            const room = getRoom(socket);
+
+            switch (data.action) {
+                case 'broadcasting':
+                    if (!isPresenter) return;
+                    room.setIsBroadcasting(data.room_broadcasting);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'lock':
+                    if (!isPresenter) return;
+                    if (!room.isLocked()) {
+                        room.setLocked(true, data.password);
+                        room.broadCast(socket.id, 'roomAction', data.action);
+                    }
+                    break;
+                case 'checkPassword':
+                    let roomData = {
+                        room: null,
+                        password: 'KO',
+                    };
+                    if (data.password == room.getPassword()) {
+                        roomData.room = room.toJson();
+                        roomData.password = 'OK';
+                    }
+                    room.sendTo(socket.id, 'roomPassword', roomData);
+                    break;
+                case 'unlock':
+                    if (!isPresenter) return;
+                    room.setLocked(false);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'globalLobbyOn':
+                    if (!room.isGlobalLobbyEnabled()) return;
+                    room.setLobbyEnabled(true);
+                    break;
+                case 'lobbyOn':
+                    if (!isPresenter) return;
+                    room.setLobbyEnabled(true);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'lobbyOff':
+                    if (!isPresenter) return;
+                    room.setLobbyEnabled(false);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'hostOnlyRecordingOn':
+                    if (!isPresenter) return;
+                    room.setHostOnlyRecording(true);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'hostOnlyRecordingOff':
+                    if (!isPresenter) return;
+                    room.setHostOnlyRecording(false);
+                    room.broadCast(socket.id, 'roomAction', data.action);
+                    break;
+                case 'isBanned':
+                    if (!isPresenter) return;
+                    log.debug('The user has been banned from the room due to spamming messages', data);
+                    room.addBannedPeer(data.peer_uuid);
+                    break;
+                default:
+                    break;
+            }
+            log.debug('Room status', {
+                broadcasting: room.isBroadcasting(),
+                locked: room.isLocked(),
+                lobby: room.isLobbyEnabled(),
+                hostOnlyRecording: room.isHostOnlyRecording(),
+            });
+        });
+
+        socket.on('roomLobby', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            const room = getRoom(socket);
+
+            const peer = room.getPeer(socket.id);
+            if (!peer) return;
+            const isPresenter = isPeerPresenter(
+                socket.room_id,
+                socket.id,
+                peer.peer_info?.peer_name,
+                peer.peer_info?.peer_uuid
+            );
+            if (!isPresenter) return;
+
+            data.room = room.toJson();
+
+            log.debug('Room lobby', {
+                peer_id: data.peer_id,
+                peer_name: data.peer_name,
+                peers_id: data.peers_id,
+                lobby: data.lobby_status,
+                broadcast: data.broadcast,
+            });
+
+            const pears_id = data.peers_id ? data.peers_id : [data.peer_id];
+
+            // Also send to all presenters to update lobby UI on there side
+            const send_to_pears_id = pears_id.concat(room.getPresenterPeers().map((peer) => peer.id));
+
+            for (const peer_id of send_to_pears_id) {
+                room.sendTo(peer_id, 'roomLobby', data);
+            }
+
+            if (data.lobby_status === 'accept') {
+                for (const peer_id of pears_id) {
+                    const peer = room.getPeer(peer_id);
+                    if (!peer.peer_lobby) continue;
+
+                    peer.updatePeerInfo({ type: 'lobby', status: false });
+
+                    handleJoinWebHook(room.id, peer.peer_info);
+                }
+            }
+        });
+
+        // ####################################################
+        // BREAKOUT ROOMS
+        // ####################################################
+
+        socket.on('getBreakoutRoomsInfo', async ({ mainRoom }, callback) => {
+            if (!roomExists(socket)) return callback([]);
+
+            const breakoutRooms = [];
+            for (const [roomId, room] of roomList) {
+                if (roomId.startsWith(mainRoom + '_breakout_')) {
+                    const peerNames = [];
+                    room.getPeers().forEach((peer) => {
+                        if (peer.peer_name) peerNames.push(peer.peer_name);
+                    });
+                    breakoutRooms.push({
+                        room: roomId,
+                        peers: room.getPeersCount(),
+                        peerNames: peerNames,
+                    });
+                }
+            }
+            callback(breakoutRooms);
+        });
+
+        socket.on('breakoutRoomBroadcast', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Breakout room broadcast', data);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const { mainRoom, targetRoom, message } = data;
+            if (!message || !mainRoom) return;
+
+            const msgData = {
+                peer_name: data.peer_name,
+                message: message,
+            };
+
+            if (targetRoom) {
+                // Send to a specific breakout room
+                const room = roomList.get(targetRoom);
+                if (room) room.sendToAll('breakoutRoomMessage', msgData);
+            } else {
+                // Send to all breakout rooms
+                for (const [roomId, room] of roomList) {
+                    if (roomId.startsWith(mainRoom + '_breakout_')) {
+                        room.sendToAll('breakoutRoomMessage', msgData);
+                    }
+                }
+            }
+        });
+
+        socket.on('breakoutRoomEnd', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Breakout room end all', data);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const { mainRoom } = data;
+            if (!mainRoom) return;
+
+            // Force all peers in breakout rooms to return to main room
+            for (const [roomId, room] of roomList) {
+                if (roomId.startsWith(mainRoom + '_breakout_')) {
+                    room.sendToAll('breakoutRoomEnd', { mainRoom });
+                }
+            }
+        });
+
+        socket.on('breakoutRoomCountdown', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Breakout room countdown', data);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const { mainRoom, countdown } = data;
+            if (!mainRoom || !countdown) return;
+
+            const seconds = Math.min(Math.max(parseInt(countdown) || 0, 0), 300);
+
+            for (const [roomId, room] of roomList) {
+                if (roomId.startsWith(mainRoom + '_breakout_')) {
+                    room.sendToAll('breakoutRoomCountdown', { mainRoom, countdown: seconds });
+                }
+            }
+        });
+
+        socket.on('breakoutRoomHelp', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Breakout room help request', data);
+
+            const { mainRoom, peer_name, breakoutRoom } = data;
+            if (!mainRoom || !peer_name || !breakoutRoom) return;
+
+            // Send help request to all peers in the main room (presenter will handle it)
+            const room = roomList.get(mainRoom);
+            if (room) {
+                room.sendToAll('breakoutRoomHelp', {
+                    peer_name: peer_name,
+                    breakoutRoom: breakoutRoom,
+                });
+            }
+        });
+
+        socket.on('breakoutRoom', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Breakout room', data);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const room = getRoom(socket);
+            if (!room) return;
+
+            // Send breakout room assignment to each assigned peer
+            const { assignments, mainRoom } = data;
+            if (assignments && Array.isArray(assignments)) {
+                for (const assignment of assignments) {
+                    const { peerId, breakoutRoom, duration, roomName } = assignment;
+                    room.sendTo(peerId, 'breakoutRoom', {
+                        action: 'assign',
+                        breakoutRoom: breakoutRoom,
+                        mainRoom: mainRoom,
+                        duration: duration || 'unlimited',
+                        roomName: roomName || breakoutRoom,
+                    });
+                }
+            }
+        });
+
+        // ####################################################
+        // BREAKOUT ROOMS END
+        // ####################################################
+
+        socket.on('peerAction', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            log.debug('Peer action', data);
+
+            if (!Validator.isValidData(data)) return;
+
+            const presenterActions = [
+                'mute',
+                'unmute',
+                'hide',
+                'unhide',
+                'stop',
+                'start',
+                'eject',
+                'ban',
+                'geoLocation',
+            ];
+
+            if (presenterActions.some((v) => data.action === v)) {
+                const isPresenter = isPeerPresenter(
+                    socket.room_id,
+                    socket.id,
+                    data.from_peer_name,
+                    data.from_peer_uuid
+                );
+                if (!isPresenter) return;
+            }
+
+            const room = getRoom(socket);
+
+            if (data.action === 'ban') room.addBannedPeer(data.to_peer_uuid);
+
+            data.broadcast
+                ? room.broadCast(data.peer_id, 'peerAction', data)
+                : room.sendTo(data.peer_id, 'peerAction', data);
+        });
+
+        socket.on('updatePeerInfo', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            if (!peer) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            peer.updatePeerInfo(data);
+
+            if (data.broadcast) {
+                log.debug('updatePeerInfo broadcast data');
+                room.broadCast(socket.id, 'updatePeerInfo', data);
+            }
+        });
+
+        socket.on('updateRoomNotifications', (dataObject, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (config.integrations?.email?.notify !== true) {
+                const message =
+                    'Email notifications are disabled by the admin. Enable this feature in your self-hosted instance for full functionality.';
+                log.debug(message);
+                return cb({ error: message });
+            }
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            room.updateRoomNotifications(data);
+
+            return cb({ message: true });
+        });
+
+        socket.on('updateRoomModerator', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const moderator = data.moderator;
+
+            room.updateRoomModerator(moderator);
+
+            switch (moderator.type) {
+                case 'audio_cant_unmute':
+                case 'video_cant_unhide':
+                case 'screen_cant_share':
+                case 'chat_cant_privately':
+                case 'chat_cant_publicly':
+                case 'chat_cant_chatgpt':
+                case 'chat_cant_deep_seek':
+                case 'media_cant_sharing':
+                case 'polls_cant_create':
+                    room.broadCast(socket.id, 'updateRoomModerator', moderator);
+                    break;
+                default:
+                    break;
+            }
+        });
+
+        socket.on('updateRoomModeratorALL', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            const moderator = data.moderator;
+
+            room.updateRoomModeratorALL(moderator);
+
+            room.broadCast(socket.id, 'updateRoomModeratorALL', moderator);
+        });
+
+        socket.on('followMe', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+
+            if (!isPresenter) return;
+
+            log.debug('Follow me', data);
+
+            switch (data.action) {
+                case 'toggle':
+                    room.setFollowMe(data.status ? { enabled: true, peerId: null, action: null } : null);
+                    break;
+                case 'pin':
+                case 'focus':
+                    room.setFollowMe({ enabled: true, peerId: data.peerId, action: data.action });
+                    break;
+                case 'unpin':
+                case 'unfocus':
+                    room.setFollowMe({ enabled: true, peerId: null, action: null });
+                    break;
+                default:
+                    break;
+            }
+
+            room.broadCast(socket.id, 'followMe', data);
+        });
+
+        socket.on('getRoomInfo', async (_, cb) => {
+            if (!roomExists(socket)) {
+                return cb({ error: 'Room not found' });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name } = peer || 'undefined';
+
+            log.debug('Send Room Info to', peer_name);
+
+            cb(room.toJson());
+        });
+
+        socket.on('fileInfo', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            if (!isValidFileName(data.fileName)) {
+                log.debug('File name not valid', data);
+                return;
+            }
+
+            log.debug('Send File Info', data);
+
+            const room = getRoom(socket);
+
+            data.broadcast ? room.broadCast(socket.id, 'fileInfo', data) : room.sendTo(data.peer_id, 'fileInfo', data);
+        });
+
+        socket.on('file', (data) => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            data.broadcast ? room.broadCast(socket.id, 'file', data) : room.sendTo(data.peer_id, 'file', data);
+        });
+
+        socket.on('fileAbort', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'fileAbort', data);
+        });
+
+        socket.on('receiveFileAbort', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'receiveFileAbort', data);
+        });
+
+        socket.on('shareVideoAction', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            if (data.action == 'open' && !isValidHttpURL(data.video_url)) {
+                log.debug('Video src not valid', data);
+                return;
+            }
+
+            log.debug('Share video: ', data);
+
+            const room = getRoom(socket);
+
+            // Enforce the moderator "everyone can't share media" rule server-side.
+            // The presenter is exempt because they own/toggle the rule.
+            if (room._moderator && room._moderator.media_cant_sharing) {
+                const isPresenter = isPeerPresenter(socket.room_id, socket.id, data.peer_name, data.peer_uuid);
+                if (!isPresenter) {
+                    log.debug('shareVideoAction blocked by moderator rule (media_cant_sharing)', {
+                        peer_name: data.peer_name,
+                    });
+                    return;
+                }
+            }
+
+            room.updateShareMedia(data);
+
+            data.peer_id == 'all'
+                ? room.broadCast(socket.id, 'shareVideoAction', data)
+                : room.sendTo(data.peer_id, 'shareVideoAction', data);
+        });
+
+        socket.on('wbCanvasToJson', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            // Security: cap whiteboard payload size. Fabric canvas JSON should comfortably
+            // fit in well under 2 MB; anything larger is either accidental (huge embedded
+            // images) or an attempt to abuse the broadcast channel as cheap amplification.
+            const rawSize =
+                typeof dataObject === 'string' ? dataObject.length : dataObject ? JSON.stringify(dataObject).length : 0;
+            if (rawSize > 2_000_000) {
+                log.debug('wbCanvasToJson blocked: payload too large', { size: rawSize });
+                return;
+            }
+
+            const room = getRoom(socket);
+
+            // Security: require the sender to be an actual joined peer of the room.
+            // Without this a socket that only called `createRoom` (which sets socket.room_id
+            // before the "already exists" check) could broadcast whiteboard payloads to all
+            // real peers without ever joining the room / appearing in the attendee list.
+            const peer = room.getPeer(socket.id);
+            if (!peer) {
+                log.debug('wbCanvasToJson blocked: sender is not a joined peer', {
+                    room_id: socket.room_id,
+                    socket_id: socket.id,
+                });
+                return;
+            }
+
+            // Security: when the whiteboard is locked, only the presenter may overwrite
+            // the shared canvas. The lock state is server-authoritative and does not
+            // depend on the client toggling its local `wbIsLock` flag.
+            const isPresenter = isPeerPresenter(
+                socket.room_id,
+                socket.id,
+                peer.peer_info?.peer_name,
+                peer.peer_info?.peer_uuid
+            );
+            if (!isPresenter && room.getWhiteboardLock()) {
+                log.debug('wbCanvasToJson blocked: whiteboard is locked and sender is not presenter', {
+                    peer_name: peer.peer_info?.peer_name,
+                });
+                return;
+            }
+
+            const data = checkXSS(dataObject);
+
+            // Security: strip fabric `image` objects whose `src` is not a safe http(s) URL
+            // or `data:image/*` URI. This prevents SSRF probes (http://127.0.0.1, AWS IMDS,
+            // 192.168/10/172.16/8 ranges…) and dangerous schemes (javascript:, file:, blob:)
+            // from being rendered by every other peer's browser.
+            const sanitized = Validator.sanitizeWbCanvasJson(data, ({ src }) => {
+                log.debug('wbCanvasToJson dropped unsafe image src', { src });
+            });
+
+            // const objLength = bytesToSize(Object.keys(data).length);
+
+            // log.debug('Send Whiteboard canvas JSON', { length: objLength });
+
+            room.broadCast(socket.id, 'wbCanvasToJson', sanitized);
+        });
+
+        socket.on('whiteboardAction', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            // Security: require the sender to be an actual joined peer of the room
+            // (see wbCanvasToJson above for rationale).
+            const peer = room.getPeer(socket.id);
+            if (!peer) {
+                log.debug('whiteboardAction blocked: sender is not a joined peer', {
+                    room_id: socket.room_id,
+                    socket_id: socket.id,
+                });
+                return;
+            }
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            // Security: whiteboardAction mutates global whiteboard state (clear / undo / redo /
+            // bgcolor / lock / unlock) for every other peer. Only the presenter is allowed
+            // to trigger these. Verify against server-known peer identity, not client-supplied
+            // peer_name / peer_uuid (which are attacker-controlled in the request body).
+            const isPresenter = isPeerPresenter(
+                socket.room_id,
+                socket.id,
+                peer.peer_info?.peer_name,
+                peer.peer_info?.peer_uuid
+            );
+            if (!isPresenter) {
+                log.debug('whiteboardAction blocked: sender is not presenter', {
+                    action: data.action,
+                    peer_name: peer.peer_info?.peer_name,
+                });
+                return;
+            }
+
+            // Overwrite the broadcast peer_name with the server-known value so a presenter
+            // can't be tricked into proxying an HTML payload supplied in the request body
+            // (the client renders `data.peer_name` inside a SweetAlert toast).
+            data.peer_name = peer.peer_info?.peer_name || data.peer_name;
+
+            // Track lock state server-side so late-joining peers / future requests are
+            // gated even if the presenter never re-toggles the button.
+            if (data.action === 'lock') room.setWhiteboardLock(true);
+            if (data.action === 'unlock') room.setWhiteboardLock(false);
+
+            log.debug('Whiteboard', data);
+            room.broadCast(socket.id, 'whiteboardAction', data);
+        });
+
+        // Video drawing overlay: relay batched drawing strokes to all peers in the room
+        socket.on('videoDrawing', (dataObject) => {
+            if (!roomExists(socket)) return;
+            const data = checkXSS(dataObject);
+            const room = getRoom(socket);
+            // log.debug('Video drawing', data);
+            room.broadCast(socket.id, 'videoDrawing', data);
+        });
+
+        socket.on('setVideoOff', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            log.debug('Video off data', data.peer_name);
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            // Persist peer_video=false so new participants joining later
+            // can correctly see the videoOff tile (e.g. after a VideoAI avatar is stopped)
+            if (peer) peer.updatePeerInfo({ type: 'video', status: false });
+
+            room.broadCast(socket.id, 'setVideoOff', data);
+        });
+
+        socket.on('recordingAction', async (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const room = getRoom(socket);
+
+            // Resolve sender from server-side state — never trust client-supplied identity
+            const peer = room.getPeer(socket.id);
+            if (!peer) return;
+
+            // If host-only recording is enabled, only the presenter may broadcast recording state
+            if (room.isHostOnlyRecording()) {
+                const isPresenter = isPeerPresenter(
+                    socket.room_id,
+                    socket.id,
+                    peer.peer_info?.peer_name,
+                    peer.peer_info?.peer_uuid
+                );
+                if (!isPresenter) return;
+            }
+
+            // Override client-supplied identity with server-side values to prevent spoofing
+            data.peer_name = peer.peer_info?.peer_name;
+            data.peer_id = socket.id;
+
+            log.debug('Recording action', data);
+
+            room.broadCast(socket.id, 'recordingAction', data);
+        });
+
+        socket.on('refreshParticipantsCount', () => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            const peerCounts = room.getPeersCount();
+
+            const data = {
+                room_id: socket.room_id,
+                peer_counts: peerCounts,
+            };
+            log.debug('Refresh Participants count', data);
+            room.broadCast(socket.id, 'refreshParticipantsCount', data);
+        });
+
+        socket.on('message', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name } = peer || 'undefined';
+
+            const realPeer = data.peer_name === peer_name;
+
+            if (!realPeer) {
+                log.warn('Fake message detected', {
+                    ip: getIpSocket(socket),
+                    realFrom: peer_name,
+                    fakeFrom: data.peer_name,
+                    msg: data.peer_msg,
+                });
+                return;
+            }
+
+            log.debug('message', data);
+
+            // Enforce moderator chat restrictions server-side
+            const isPublicMessage = data.to_peer_id === 'all';
+            const isChatGPTMessage = data.to_peer_id === 'ChatGPT';
+            const isDeepSeekMessage = data.to_peer_id === 'DeepSeek';
+            if (room._moderator) {
+                if (isChatGPTMessage && room._moderator.chat_cant_chatgpt) {
+                    log.debug('Blocking ChatGPT message: disabled by moderator', { peer_name });
+                    return;
+                }
+                if (isDeepSeekMessage && room._moderator.chat_cant_deep_seek) {
+                    log.debug('Blocking DeepSeek message: disabled by moderator', { peer_name });
+                    return;
+                }
+                if (!isChatGPTMessage && !isDeepSeekMessage) {
+                    if (isPublicMessage && room._moderator.chat_cant_publicly) {
+                        log.debug('Blocking public message: disabled by moderator', { peer_name });
+                        return;
+                    }
+                    if (!isPublicMessage && room._moderator.chat_cant_privately) {
+                        log.debug('Blocking private message: disabled by moderator', { peer_name });
+                        return;
+                    }
+                }
+            }
+
+            data.to_peer_id == 'all'
+                ? room.broadCast(socket.id, 'message', data)
+                : room.sendTo(data.to_peer_id, 'message', data);
+        });
+
+        socket.on('chatReaction', (dataObject) => {
+            if (!roomExists(socket)) return;
+            const data = checkXSS(dataObject);
+            if (!Validator.isValidData(data)) return;
+            const { room } = getRoomAndPeer(socket);
+            room.broadCast(socket.id, 'chatReaction', data);
+        });
+
+        socket.on('getChatGPT', async ({ time, room, name, prompt, context }, cb) => {
+            if (!roomExists(socket)) {
+                return cb({ message: 'Room not found' });
+            }
+
+            const roomObj = getRoom(socket);
+            if (roomObj && roomObj._moderator && roomObj._moderator.chat_cant_chatgpt) {
+                log.debug('Blocking ChatGPT request: disabled by moderator', { name });
+                return cb({ message: 'The moderator does not allow you to chat with ChatGPT' });
+            }
+
+            if (!config?.integrations?.chatGPT?.enabled) {
+                return cb({ message: 'ChatGPT integration is disabled. Please try again later!' });
+            }
+
+            // https://platform.openai.com/docs/api-reference/completions/create
+            try {
+                if (!prompt || !Array.isArray(context)) {
+                    throw new Error('Invalid input: Prompt or context is missing or invalid');
+                }
+                // Add the prompt to the context
+                context.push({ role: 'user', content: prompt });
+
+                // Call OpenAI's API to generate response (with retry on transient 5xx errors)
+                const MAX_RETRIES = 3;
+                let completion;
+                for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    try {
+                        completion = await chatGPT.chat.completions.create({
+                            model: config?.integrations?.chatGPT?.model || 'gpt-3.5-turbo',
+                            messages: context,
+                            max_tokens: config?.integrations?.chatGPT?.max_tokens || 1024,
+                            temperature: config?.integrations?.chatGPT?.temperature || 0.7,
+                        });
+                        break; // success
+                    } catch (retryError) {
+                        const isTransient = retryError.status >= 500 && retryError.status < 600;
+                        if (isTransient && attempt < MAX_RETRIES) {
+                            const delay = Math.pow(2, attempt) * 500; // 1s, 2s backoff
+                            log.warn(
+                                `ChatGPT transient error (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms`,
+                                {
+                                    status: retryError.status,
+                                    message: retryError.message,
+                                }
+                            );
+                            await new Promise((resolve) => setTimeout(resolve, delay));
+                        } else {
+                            throw retryError;
+                        }
+                    }
+                }
+
+                // Extract the assistant's response
+                const message = completion.choices[0].message.content.trim();
+                if (!message) {
+                    throw new Error('ChatGPT returned an empty response.');
+                }
+
+                // Add response to context
+                context.push({ role: 'assistant', content: message });
+
+                // Log the conversation details
+                log.debug('ChatGPT Response', {
+                    time,
+                    room,
+                    name,
+                    prompt,
+                    response: message,
+                    context,
+                });
+
+                // Callback response to client
+                cb({ message, context });
+            } catch (error) {
+                if (error.name === 'APIError') {
+                    log.error('ChatGPT', {
+                        name: error.name,
+                        status: error.status,
+                        message: error.message,
+                        code: error.code,
+                        type: error.type,
+                    });
+                    return cb({ message: `ChatGPT API Error: ${error.message}` });
+                } else {
+                    // Handle general errors
+                    log.error('ChatGPT Error', error);
+                    cb({ message: `Error: ${error.message}` });
+                }
+            }
+        });
+
+        socket.on('getDeepSeek', async ({ time, room, name, prompt, context }, cb) => {
+            if (!roomExists(socket)) {
+                return cb({ message: 'Room not found' });
+            }
+
+            const roomObj = getRoom(socket);
+            if (roomObj && roomObj._moderator && roomObj._moderator.chat_cant_deep_seek) {
+                log.debug('Blocking DeepSeek request: disabled by moderator', { name });
+                return cb({ message: 'The moderator does not allow you to chat with DeepSeek' });
+            }
+
+            if (!config?.integrations?.deepSeek?.enabled) {
+                return cb({ message: 'DeepSeek integration is disabled. Please try again later!' });
+            }
+
+            try {
+                if (!prompt || !Array.isArray(context)) {
+                    throw new Error('Invalid input: Prompt or context is missing or invalid.');
+                }
+
+                // Add the prompt to the context
+                context.push({ role: 'user', content: prompt });
+
+                // Call DeepSeek's API to generate response
+                const response = await axios.post(
+                    `${config?.integrations?.deepSeek?.basePath}chat/completions`,
+                    {
+                        model: config?.integrations?.deepSeek?.model || 'deepseek-chat',
+                        messages: context,
+                        max_tokens: config?.integrations?.deepSeek?.max_tokens || 1024,
+                        temperature: config?.integrations?.deepSeek?.temperature || 0.7,
+                    },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${config?.integrations?.deepSeek?.apiKey}`,
+                            'Content-Type': 'application/json',
+                        },
+                    }
+                );
+
+                // Extract the assistant's response
+                const message = response.data.choices[0]?.message?.content?.trim();
+                if (!message) {
+                    throw new Error('DeepSeek returned an empty response.');
+                }
+
+                // Add response to context
+                context.push({ role: 'assistant', content: message });
+
+                // Log the conversation details
+                log.debug('DeepSeek Response', {
+                    time,
+                    room,
+                    name,
+                    prompt,
+                    response: message,
+                    context,
+                });
+
+                // Send the response back to the client
+                cb({ message, context });
+            } catch (error) {
+                // Handle API-specific errors
+                if (error.response) {
+                    log.error('DeepSeek API Error', {
+                        status: error.response.status,
+                        data: error.response.data,
+                    });
+                    return cb({ message: `DeepSeek API Error: ${error.response.data?.message || error.message}` });
+                }
+
+                // Handle general errors
+                log.error('DeepSeek Error', error);
+                cb({ message: `Error: ${error.message}` });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/list_public_avatars_v1_avatars_public_get
+        // https://docs.liveavatar.com/reference/list_user_avatars_v1_avatars_get
+        socket.on('getAvatarList', async ({}, cb) => {
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const headers = {
+                    'Content-Type': 'application/json',
+                    'X-API-KEY': config?.integrations?.videoAI?.apiKey,
+                };
+
+                const [publicRes, privateRes] = await Promise.allSettled([
+                    axios.get(`${config?.integrations?.videoAI?.basePath}/v1/avatars/public?page_size=100`, {
+                        headers,
+                    }),
+                    axios.get(`${config?.integrations?.videoAI?.basePath}/v1/avatars?page_size=100`, { headers }),
+                ]);
+
+                const publicAvatars = publicRes.status === 'fulfilled' ? publicRes.value.data?.data?.results || [] : [];
+                const privateAvatars =
+                    privateRes.status === 'fulfilled' ? privateRes.value.data?.data?.results || [] : [];
+
+                // Normalize LiveAvatar fields to match client expectations
+                const avatars = [...publicAvatars, ...privateAvatars].map((a) => ({
+                    avatar_id: a.id,
+                    avatar_name: a.name,
+                    preview_image_url: a.preview_url,
+                    preview_video_url: null,
+                    is_paid: false,
+                }));
+
+                const data = { response: { avatars } };
+
+                //log.debug('getAvatarList', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('getAvatarList', error.response?.data || error.message);
+                cb({ error: error.response?.status === 500 ? 'Internal server error' : error.message });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/list_voices_v1_voices_get
+        socket.on('getVoiceList', async ({}, cb) => {
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const response = await axios.get(`${config?.integrations?.videoAI?.basePath}/v1/voices?page_size=100`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-KEY': config?.integrations?.videoAI?.apiKey,
+                    },
+                });
+
+                // Normalize LiveAvatar fields to match client expectations
+                const voices = (response.data?.data?.results || []).map((v) => ({
+                    voice_id: v.id,
+                    name: v.name,
+                    language: v.language,
+                    gender: v.gender,
+                    is_paid: false,
+                }));
+
+                const data = { response: { voices } };
+
+                //log.debug('getVoiceList', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('getVoiceList', error.response?.data || error.message);
+                cb({ error: error.response?.status === 500 ? 'Internal server error' : error.message });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/get_voice_preview_by_id_v1_voices__voice_id__preview_get
+        socket.on('previewVoice', async ({ voice_id }, cb) => {
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const response = await axios.get(
+                    `${config?.integrations?.videoAI?.basePath}/v1/voices/${encodeURIComponent(voice_id)}/preview`,
+                    {
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-API-KEY': config?.integrations?.videoAI?.apiKey,
+                        },
+                    }
+                );
+
+                const audioBase64 = response.data?.data?.audio_base64;
+                if (audioBase64) {
+                    cb({ audio: `data:audio/mpeg;base64,${audioBase64}` });
+                } else {
+                    cb({ error: 'No audio preview available for this voice' });
+                }
+            } catch (error) {
+                log.error('previewVoice', error.response?.data || error.message);
+                cb({ error: 'Voice preview not available' });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/create_session_token_v1_sessions_token_post
+        socket.on('createSessionToken', async ({ quality, avatar_id, voice_id }, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+            try {
+                const mode = config?.integrations?.videoAI?.mode || 'FULL';
+                const contextId = config?.integrations?.videoAI?.contextId;
+
+                const avatarPersona = {};
+                if (voice_id) avatarPersona.voice_id = voice_id;
+                if (contextId) avatarPersona.context_id = contextId;
+
+                const body = {
+                    mode,
+                    avatar_id,
+                    video_settings: { quality: quality || 'high' },
+                };
+
+                if (mode === 'FULL') {
+                    body.avatar_persona = avatarPersona;
+                }
+
+                const response = await axios.post(
+                    `${config?.integrations?.videoAI?.basePath}/v1/sessions/token`,
+                    body,
+                    {
+                        headers: {
+                            accept: 'application/json',
+                            'content-type': 'application/json',
+                            'X-API-KEY': config?.integrations?.videoAI?.apiKey,
+                        },
+                    }
+                );
+
+                const data = { response: response.data };
+
+                log.debug('createSessionToken', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('createSessionToken', error.response?.data || error.message);
+                cb({
+                    error:
+                        error.response?.status === 500
+                            ? 'Internal server error'
+                            : error.response?.data || error.message,
+                });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/start_session_v1_sessions_start_post
+        socket.on('startSession', async ({ session_token }, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const response = await axios.post(
+                    `${config?.integrations?.videoAI?.basePath}/v1/sessions/start`,
+                    {},
+                    {
+                        headers: {
+                            accept: 'application/json',
+                            Authorization: `Bearer ${session_token}`,
+                        },
+                    }
+                );
+
+                const data = { response: response.data.data };
+
+                log.debug('startSession', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('startSession', error.response?.data || error.message);
+                cb({
+                    error:
+                        error.response?.data?.message ||
+                        (error.response?.status === 500 ? 'Internal server error' : error.message),
+                });
+            }
+        });
+
+        socket.on('talkToOpenAI', async ({ text, context }, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const systemLimit = config?.integrations?.videoAI?.systemLimit;
+                const arr = {
+                    messages: [...context, { role: 'system', content: systemLimit }, { role: 'user', content: text }],
+                    model: 'gpt-3.5-turbo',
+                };
+                const MAX_RETRIES = 3;
+                let chatCompletion;
+                for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    try {
+                        chatCompletion = await chatGPT.chat.completions.create(arr);
+                        break; // success
+                    } catch (retryError) {
+                        const isTransient = retryError.status >= 500 && retryError.status < 600;
+                        if (isTransient && attempt < MAX_RETRIES) {
+                            const delay = Math.pow(2, attempt) * 500; // 1s, 2s backoff
+                            log.warn(
+                                `talkToOpenAI transient error (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms`,
+                                {
+                                    status: retryError.status,
+                                    message: retryError.message,
+                                }
+                            );
+                            await new Promise((resolve) => setTimeout(resolve, delay));
+                        } else {
+                            throw retryError;
+                        }
+                    }
+                }
+                const chatText = chatCompletion.choices[0].message.content;
+                context.push({ role: 'system', content: chatText });
+                context.push({ role: 'assistant', content: chatText });
+
+                const data = { response: chatText, context: context };
+
+                log.debug('talkToOpenAI', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('talkToOpenAI', error.response?.data || error.message);
+                cb({
+                    error:
+                        error.response?.data?.message ||
+                        (error.response?.status === 500 ? 'Internal server error' : error.message),
+                });
+            }
+        });
+
+        // https://docs.liveavatar.com/reference/stop_session_v1_sessions_stop_post
+        socket.on('stopSession', async ({ session_id }, cb) => {
+            if (!roomExists(socket)) return;
+
+            if (!config?.integrations?.videoAI?.enabled || !config?.integrations?.videoAI?.apiKey)
+                return cb({ error: 'Video AI seems disabled, try later!' });
+
+            try {
+                const response = await axios.post(
+                    `${config?.integrations?.videoAI?.basePath}/v1/sessions/stop`,
+                    {
+                        session_id,
+                    },
+                    {
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-API-KEY': config?.integrations?.videoAI?.apiKey,
+                        },
+                    }
+                );
+
+                const data = { response: response.data };
+
+                log.debug('stopSession', data);
+
+                cb(data);
+            } catch (error) {
+                log.error('stopSession', error.response?.data || error.message);
+                cb({ error: error.response?.status === 500 ? 'Internal server error' : error.message });
+            }
+        });
+
+        socket.on('getRTMP', async ({}, cb) => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            const rtmpFiles = await room.getRTMP(rtmpDir);
+
+            cb(rtmpFiles);
+        });
+
+        socket.on('startRTMP', async (dataObject, cb) => {
+            if (!roomExists(socket)) return;
+
+            const totalActive = getRtmpTotalActiveStreamsCount();
+            if (rtmpCfg && totalActive >= rtmpCfg.maxStreams) {
+                log.warn('RTMP max streams reached', { total: totalActive, maxStreams: rtmpCfg.maxStreams });
+                return cb(false);
+            }
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return cb(false);
+
+            const { peer_name, peer_uuid, file } = data;
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+            if (!isPresenter) return cb(false);
+
+            const room = getRoom(socket);
+
+            const DEFAULT_HOST = 'localhost';
+            const host = config?.ngrok?.enabled
+                ? DEFAULT_HOST
+                : socket?.handshake?.headers?.host?.split(':')[0] || DEFAULT_HOST;
+
+            const customRtmpUrl = data.customRtmpUrl || null;
+
+            const rtmp = await room.startRTMP(socket.id, room, host, 1935, `${rtmpDir}/${file}`, customRtmpUrl);
+
+            log.debug('startRTMP - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+
+            cb(rtmp);
+        });
+
+        socket.on('stopRTMP', async () => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            const peer = room.getPeer(socket.id);
+            if (!peer) return;
+            const isPresenter = isPeerPresenter(
+                socket.room_id,
+                socket.id,
+                peer.peer_info?.peer_name,
+                peer.peer_info?.peer_uuid
+            );
+            if (!isPresenter) return;
+
+            await room.stopRTMP();
+
+            log.debug('stopRTMP - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+        });
+
+        socket.on('endOrErrorRTMP', async () => {
+            if (!roomExists(socket)) return;
+
+            log.debug('endRTMP - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+        });
+
+        socket.on('startRTMPfromURL', async (dataObject, cb) => {
+            if (!roomExists(socket)) return;
+
+            const totalActive = getRtmpTotalActiveStreamsCount();
+            if (rtmpCfg && totalActive >= rtmpCfg.maxStreams) {
+                log.warn('RTMP max streams reached', { total: totalActive, maxStreams: rtmpCfg.maxStreams });
+                return cb(false);
+            }
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return cb(false);
+
+            const { peer_name, peer_uuid, inputVideoURL } = data;
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+            if (!isPresenter) return cb(false);
+
+            const room = getRoom(socket);
+
+            const DEFAULT_HOST = 'localhost';
+            const host = config?.integrations?.ngrok?.enabled
+                ? DEFAULT_HOST
+                : socket?.handshake?.headers?.host?.split(':')[0] || DEFAULT_HOST;
+
+            const customRtmpUrl = data.customRtmpUrl || null;
+
+            const rtmp = await room.startRTMPfromURL(socket.id, room, host, 1935, inputVideoURL, customRtmpUrl);
+
+            log.debug('startRTMPfromURL - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+
+            cb(rtmp);
+        });
+
+        socket.on('stopRTMPfromURL', async () => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            const peer = room.getPeer(socket.id);
+            if (!peer) return;
+            const isPresenter = isPeerPresenter(
+                socket.room_id,
+                socket.id,
+                peer.peer_info?.peer_name,
+                peer.peer_info?.peer_uuid
+            );
+            if (!isPresenter) return;
+
+            await room.stopRTMPfromURL();
+
+            log.debug('stopRTMPfromURL - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+        });
+
+        socket.on('endOrErrorRTMPfromURL', async () => {
+            if (!roomExists(socket)) return;
+
+            log.debug('endRTMPfromURL - rtmpTotalActiveStreamsCount ---->', getRtmpTotalActiveStreamsCount());
+        });
+
+        socket.on('createPoll', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const { question, options } = data;
+
+            const room = getRoom(socket);
+
+            // Enforce the moderator "only presenter can create/edit/delete polls" rule server-side.
+            if (room._moderator && room._moderator.polls_cant_create) {
+                const peer = room.getPeer(socket.id);
+                const isPresenter = isPeerPresenter(
+                    socket.room_id,
+                    socket.id,
+                    peer?.peer_info?.peer_name,
+                    peer?.peer_info?.peer_uuid
+                );
+                if (!isPresenter) {
+                    log.debug('createPoll blocked by moderator rule (polls_cant_create)', {
+                        peer_name: peer?.peer_info?.peer_name,
+                    });
+                    return;
+                }
+            }
+
+            const newPoll = {
+                question: question,
+                options: options,
+                voters: new Map(),
+            };
+
+            const roomPolls = room.getPolls();
+
+            roomPolls.push(newPoll);
+            room.sendToAll('updatePolls', room.convertPolls(roomPolls));
+            log.debug('[Poll] createPoll', roomPolls);
+        });
+
+        socket.on('vote', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name } = peer || socket.id;
+
+            const roomPolls = room.getPolls();
+
+            const poll = roomPolls[data.pollIndex];
+            if (poll) {
+                poll.voters.set(peer_name, data.option);
+                room.sendToAll('updatePolls', room.convertPolls(roomPolls));
+                log.debug('[Poll] vote', roomPolls);
+            }
+        });
+
+        socket.on('updatePoll', () => {
+            if (!roomExists(socket)) return;
+
+            const room = getRoom(socket);
+
+            const roomPolls = room.getPolls();
+
+            if (roomPolls.length > 0) {
+                room.sendToAll('updatePolls', room.convertPolls(roomPolls));
+                log.debug('[Poll] updatePoll', roomPolls);
+            }
+        });
+
+        socket.on('editPoll', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            if (!Validator.isValidData(data)) return;
+
+            const { index, question, options } = data;
+
+            const room = getRoom(socket);
+
+            // Enforce the moderator "only presenter can create/edit/delete polls" rule server-side.
+            if (room._moderator && room._moderator.polls_cant_create) {
+                const peer = room.getPeer(socket.id);
+                const isPresenter = isPeerPresenter(
+                    socket.room_id,
+                    socket.id,
+                    peer?.peer_info?.peer_name,
+                    peer?.peer_info?.peer_uuid
+                );
+                if (!isPresenter) {
+                    log.debug('editPoll blocked by moderator rule (polls_cant_create)', {
+                        peer_name: peer?.peer_info?.peer_name,
+                    });
+                    return;
+                }
+            }
+
+            const roomPolls = room.getPolls();
+
+            if (roomPolls[index]) {
+                roomPolls[index].question = question;
+                roomPolls[index].options = options;
+                room.sendToAll('updatePolls', roomPolls);
+                log.debug('[Poll] editPoll', roomPolls);
+            }
+        });
+
+        socket.on('deletePoll', async (data) => {
+            if (!roomExists(socket)) return;
+
+            const { index, peer_name, peer_uuid } = checkXSS(data);
+
+            const room = getRoom(socket);
+
+            // Enforce the moderator "only presenter can create/edit/delete polls" rule server-side.
+            if (room._moderator && room._moderator.polls_cant_create) {
+                const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+                if (!isPresenter) {
+                    log.debug('deletePoll blocked by moderator rule (polls_cant_create)', { peer_name });
+                    return;
+                }
+            }
+
+            const roomPolls = room.getPolls();
+
+            if (roomPolls[index]) {
+                roomPolls.splice(index, 1);
+                room.sendToAll('updatePolls', roomPolls);
+                log.debug('[Poll] deletePoll', roomPolls);
+            }
+        });
+
+        // Room collaborative editor
+
+        socket.on('editorChange', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            //const data = checkXSS(dataObject);
+            const data = dataObject;
+
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'editorChange', data);
+        });
+
+        socket.on('editorActions', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            const data = checkXSS(dataObject);
+
+            const room = getRoom(socket);
+
+            log.debug('editorActions', data);
+
+            room.broadCast(socket.id, 'editorActions', data);
+        });
+
+        socket.on('editorUpdate', (dataObject) => {
+            if (!roomExists(socket)) return;
+
+            //const data = checkXSS(dataObject);
+            const data = dataObject;
+
+            const room = getRoom(socket);
+
+            room.broadCast(socket.id, 'editorUpdate', data);
+        });
+
+        socket.on('disconnect', (reason) => {
+            if (!roomExists(socket)) {
+                // Clean up socket listeners even if room doesn't exist
+                socket.removeAllListeners();
+                return;
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name, peer_uuid } = peer || {};
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+
+            log.debug('[Disconnect] - peer name', { peer_name, reason });
+
+            if (webhook.enabled) {
+                const data = {
+                    timestamp: log.getDateTime(false),
+                    room_id: socket.room_id,
+                    peer: peer?.peer_info,
+                    reason: reason,
+                };
+                // Trigger a POST request when a user disconnects
+                axios
+                    .post(webhook.url, { event: 'disconnect', data }, { timeout: 5000 })
+                    .then((response) => log.debug('Disconnect event tracked:', response.data))
+                    .catch((error) => log.error('Error tracking disconnect event:', error.message));
+            }
+
+            room.removePeer(socket.id);
+
+            room.broadCast(socket.id, 'removeMe', removeMeData(room, peer_name, isPresenter));
+
+            // Notify main room when a peer leaves a breakout room
+            if (socket.room_id.includes('_breakout_')) {
+                notifyMainRoomBreakoutCountChanged(socket.room_id);
+            }
+
+            // Clean up this peer's presenter entry immediately
+            if (socket.room_id in presenters && socket.id in presenters[socket.room_id]) {
+                delete presenters[socket.room_id][socket.id];
+            }
+
+            if (room.getPeersCount() === 0) {
+                //
+                stopRTMPActiveStreams(isPresenter, room);
+
+                roomList.delete(socket.room_id);
+
+                delete presenters[socket.room_id];
+
+                log.debug('[Disconnect] - Last peer - current presenters grouped by roomId', presenters);
+
+                const activeRooms = getActiveRooms();
+
+                log.debug('[Disconnect] - Last peer - current active rooms', activeRooms);
+
+                const activeStreams = getRTMPActiveStreams();
+
+                log.debug('[Disconnect] - Last peer - current active RTMP streams', activeStreams);
+            }
+
+            removeIP(socket);
+
+            socket.room_id = null;
+
+            // Clean up all socket event listeners to prevent memory leaks
+            socket.removeAllListeners();
+        });
+
+        socket.on('exitRoom', (_, callback) => {
+            if (!roomExists(socket)) {
+                return callback({
+                    error: 'Not currently in a room',
+                });
+            }
+
+            const { room, peer } = getRoomAndPeer(socket);
+
+            const { peer_name, peer_uuid } = peer || {};
+
+            const isPresenter = isPeerPresenter(socket.room_id, socket.id, peer_name, peer_uuid);
+
+            log.debug('Exit room', peer_name);
+
+            if (webhook.enabled) {
+                const data = {
+                    timestamp: log.getDateTime(false),
+                    room_id: socket.room_id,
+                    peer: peer?.peer_info,
+                };
+                // Trigger a POST request when a user exits
+                axios
+                    .post(webhook.url, { event: 'exit', data }, { timeout: 5000 })
+                    .then((response) => log.debug('ExitRoom event tracked:', response.data))
+                    .catch((error) => log.error('Error tracking exitRoom event:', error.message));
+            }
+
+            room.removePeer(socket.id);
+
+            room.broadCast(socket.id, 'removeMe', removeMeData(room, peer_name, isPresenter));
+
+            // Clean up this peer's presenter entry immediately
+            if (socket.room_id in presenters && socket.id in presenters[socket.room_id]) {
+                delete presenters[socket.room_id][socket.id];
+            }
+
+            if (room.getPeersCount() === 0) {
+                //
+                stopRTMPActiveStreams(isPresenter, room);
+
+                roomList.delete(socket.room_id);
+
+                delete presenters[socket.room_id];
+
+                log.debug('[REMOVE ME] - Last peer - current presenters grouped by roomId', presenters);
+
+                const activeRooms = getActiveRooms();
+
+                log.debug('[REMOVE ME] - Last peer - current active rooms', activeRooms);
+
+                const activeStreams = getRTMPActiveStreams();
+
+                log.debug('[REMOVE ME] - Last peer - current active RTMP streams', activeStreams);
+            }
+
+            removeIP(socket);
+
+            socket.room_id = null;
+
+            callback('Successfully exited room');
+        });
+
+        // Helpers
+
+        async function handleJoinWebHook(room_id, peer_info) {
+            // handle WebHook
+            if (webhook.enabled) {
+                // Trigger a POST request when a user joins
+                const data = {
+                    timestamp: log.getDateTime(false),
+                    room_id,
+                    peer_info,
+                };
+
+                axios
+                    .post(webhook.url, { event: 'join', data }, { timeout: 5000 })
+                    .then((response) => log.debug('Join event tracked:', response.data))
+                    .catch((error) => log.error('Error tracking join event:', error.message));
+            }
+        }
+
+        function getRoomAndPeer(socket) {
+            const room = getRoom(socket);
+
+            const peer = getPeer(socket);
+
+            return { room, peer };
+        }
+
+        function getRoom(socket) {
+            return roomList.get(socket.room_id) || null;
+        }
+
+        function getPeer(socket) {
+            const room = getRoom(socket); // Reusing getRoom to retrieve the room
+
+            return room.getPeer ? room.getPeer(socket.id) || null : null;
+        }
+
+        function roomExists(socket) {
+            return roomList.has(socket.room_id);
+        }
+
+        // Security: block lobby-waiting peers from WebRTC/media handlers.
+        function isPeerInLobby(peer) {
+            return Boolean(peer && peer.peer_lobby === true);
+        }
+
+        function getPeerInfo(peer) {
+            if (!peer || !peer.peer_info) {
+                return {
+                    peer_name: peer?.peer_name || 'Unknown',
+                    isDesktop: false,
+                    os: 'Unknown',
+                    browser: 'Unknown',
+                };
+            }
+
+            const { peer_name, peer_info } = peer;
+            const { is_desktop_device, os_name, os_version, browser_name, browser_version } = peer_info;
+
+            return {
+                peer_name: peer_name || 'Unknown',
+                isDesktop: Boolean(is_desktop_device),
+                os: os_name && os_version ? `${os_name} ${os_version}` : os_name || 'Unknown',
+                browser:
+                    browser_name && browser_version ? `${browser_name} ${browser_version}` : browser_name || 'Unknown',
+            };
+        }
+
+        function isValidFileName(fileName) {
+            const invalidChars = /[\\\/\?\*\|:"<>]/;
+            return !invalidChars.test(fileName);
+        }
+
+        function isValidHttpURL(input) {
+            try {
+                const url = new URL(input);
+                return url.protocol === 'http:' || url.protocol === 'https:';
+            } catch (_) {
+                return false;
+            }
+        }
+
+        function removeMeData(room, peerName, isPresenter) {
+            const roomId = room && socket.room_id;
+            const peerCounts = room && room.getPeersCount();
+            const data = {
+                room_id: roomId,
+                peer_id: socket.id,
+                peer_name: peerName,
+                peer_counts: peerCounts,
+                isPresenter: isPresenter,
+            };
+            log.debug('Peer removed from the room', data);
+            return data;
+        }
+
+        function notifyMainRoomBreakoutCountChanged(breakoutRoomId) {
+            const mainRoomId = breakoutRoomId.split('_breakout_')[0];
+            const mainRoom = roomList.get(mainRoomId);
+            if (mainRoom) {
+                mainRoom.sendToAll('breakoutRoomCountsChanged', { breakoutRoom: breakoutRoomId });
+            }
+        }
+    });
+
+    function generateRTMPUrl(baseURL, streamPath, secretKey, expirationHours = 4) {
+        const currentTime = Math.floor(Date.now() / 1000);
+        const expirationTime = currentTime + expirationHours * 3600;
+        const hashValue = crypto.MD5(`${streamPath}-${expirationTime}-${secretKey}`).toString();
+        const rtmpUrl = `${baseURL}${streamPath}?sign=${expirationTime}-${hashValue}`;
+
+        log.debug('generateRTMPUrl', {
+            currentTime,
+            expirationTime,
+            hashValue,
+            rtmpUrl,
+        });
+
+        return rtmpUrl;
+    }
+
+    function getRTMPActiveStreams() {
+        return {
+            rtmpTotalActiveStreamsCount: getRtmpTotalActiveStreamsCount(),
+        };
+    }
+
+    function stopRTMPActiveStreams(isPresenter, room) {
+        // When the room is closing (last peer), clean up regardless of presenter status
+        const forceCleanup = room.getPeersCount() === 0;
+
+        if (isPresenter || forceCleanup) {
+            if (room.isRtmpFileStreamerActive()) {
+                room.stopRTMP();
+                log.debug(
+                    'stopRTMPActiveStreams - file stream stopped, rtmpTotalActiveStreamsCount',
+                    getRtmpTotalActiveStreamsCount()
+                );
+            }
+            if (room.isRtmpUrlStreamerActive()) {
+                room.stopRTMPfromURL();
+                log.debug(
+                    'stopRTMPActiveStreams - URL stream stopped, rtmpTotalActiveStreamsCount',
+                    getRtmpTotalActiveStreamsCount()
+                );
+            }
+        }
+    }
+
+    function bytesToSize(bytes) {
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        if (bytes == 0) return '0 Byte';
+        const i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
+        return Math.round(bytes / Math.pow(1024, i), 2) + ' ' + sizes[i];
+    }
+
+    function clone(value) {
+        if (value === undefined) return undefined;
+        if (Number.isNaN(value)) return NaN;
+        if (typeof structuredClone === 'function') return structuredClone(value);
+        return JSON.parse(JSON.stringify(value));
+    }
+
+    function isPeerPresenter(room_id, peer_id, peer_name, peer_uuid) {
+        try {
+            // 1. Direct lookup by peer_id (server-assigned socket.id — not user-controlled)
+            const storedPresenter = presenters[room_id]?.[peer_id];
+            if (storedPresenter) {
+                const isPresenter =
+                    storedPresenter.peer_name === peer_name &&
+                    storedPresenter.peer_uuid === peer_uuid &&
+                    storedPresenter.is_presenter === true;
+
+                log.debug('isPeerPresenter Check (stored)', {
+                    room_id: room_id,
+                    peer_id: peer_id,
+                    peer_name: peer_name,
+                    peer_uuid: peer_uuid,
+                    isPresenter: isPresenter,
+                });
+
+                return isPresenter;
+            }
+
+            // 2. Static presenter list — verify against server-side registered name, not user input
+            const room = roomList.get(room_id);
+            const peer = room?.getPeer(peer_id);
+            if (peer && hostCfg?.presenters?.list?.includes(peer.peer_info.peer_name)) {
+                log.debug('isPeerPresenter Check (static list)', {
+                    room_id: room_id,
+                    peer_id: peer_id,
+                    peer_name: peer.peer_info.peer_name,
+                    isPresenter: true,
+                });
+                return true;
+            }
+
+            // 3. Not a presenter
+            log.debug('isPeerPresenter Check (denied)', {
+                room_id: room_id,
+                peer_id: peer_id,
+                peer_name: peer_name,
+                peer_uuid: peer_uuid,
+                isPresenter: false,
+            });
+
+            return false;
+        } catch (err) {
+            log.error('isPeerPresenter Check error', err);
+            return false;
+        }
+    }
+
+    async function isAuthPeer(username, password) {
+        if (hostCfg.users_from_db && hostCfg.users_api_endpoint) {
+            try {
+                // Using either email or username, as the username can also be an email here.
+                const response = await axios.post(
+                    hostCfg.users_api_endpoint,
+                    {
+                        email: username,
+                        username: username,
+                        password: password,
+                        api_secret_key: hostCfg.users_api_secret_key,
+                    },
+                    {
+                        timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                    }
+                );
+                return response.data && response.data.message === true;
+            } catch (error) {
+                log.error('AXIOS isAuthPeer error', error.message);
+                return false;
+            }
+        } else {
+            return (
+                hostCfg.users && hostCfg.users.some((user) => user.username === username && user.password === password)
+            );
+        }
+    }
+
+    async function isValidToken(token) {
+        return new Promise((resolve, reject) => {
+            jwt.verify(token, jwtCfg.JWT_KEY, (err, decoded) => {
+                if (err) {
+                    // Token is invalid
+                    resolve(false);
+                } else {
+                    // Token is valid
+                    resolve(true);
+                }
+            });
+        });
+    }
+
+    function encodeToken(token) {
+        if (!token) return '';
+
+        const { username = 'username', password = 'password', presenter = false, expire } = token;
+
+        const expireValue = expire || jwtCfg.JWT_EXP;
+
+        // Constructing payload
+        const payload = {
+            username: String(username),
+            password: String(password),
+            presenter: String(presenter),
+        };
+
+        // Encrypt payload using AES encryption
+        const payloadString = JSON.stringify(payload);
+        const encryptedPayload = CryptoJS.AES.encrypt(payloadString, jwtCfg.JWT_KEY).toString();
+
+        // Constructing JWT token
+        const jwtToken = jwt.sign({ data: encryptedPayload }, jwtCfg.JWT_KEY, { expiresIn: expireValue });
+
+        return jwtToken;
+    }
+
+    function decodeToken(jwtToken) {
+        if (!jwtToken) return null;
+
+        // Verify and decode the JWT token
+        const decodedToken = jwt.verify(jwtToken, jwtCfg.JWT_KEY);
+        if (!decodedToken || !decodedToken.data) {
+            throw new Error('Invalid token');
+        }
+
+        // Decrypt the payload using AES decryption
+        const decryptedPayload = CryptoJS.AES.decrypt(decodedToken.data, jwtCfg.JWT_KEY).toString(CryptoJS.enc.Utf8);
+
+        // Parse the decrypted payload as JSON
+        const payload = JSON.parse(decryptedPayload);
+
+        return payload;
+    }
+
+    function getActiveRooms() {
+        const roomIds = Array.from(roomList.keys());
+        const roomPeersArray = roomIds.map((roomId) => {
+            const room = roomList.get(roomId);
+            const peerCount = (room && room.getPeersCount()) || 0;
+            const broadcasting = (room && room.isBroadcasting()) || false;
+            return {
+                room: roomId,
+                broadcasting: broadcasting,
+                peers: peerCount,
+            };
+        });
+        return roomPeersArray;
+    }
+
+    function isAllowedRoomAccess(logMessage, req, hostCfg, roomList, roomId) {
+        const OIDCUserAuthenticated = OIDC.enabled && req.oidc.isAuthenticated();
+        const hostUserAuthenticated = hostCfg.protected && hostCfg.authenticated;
+        const roomExist = roomList.has(roomId);
+        const roomCount = roomList.size;
+        const OIDCAllowRoomCreationForAuthUsers = OIDC.allow_rooms_creation_for_auth_users;
+
+        const allowRoomAccess =
+            (!hostCfg.protected && !OIDC.enabled) || // Default open access
+            (OIDCUserAuthenticated && roomExist) || // OIDC auth & room exists
+            (hostUserAuthenticated && roomExist) || // Host login auth & room exists
+            ((OIDCUserAuthenticated || hostUserAuthenticated) && roomCount === 0) || // First room creation
+            (OIDCUserAuthenticated && OIDCAllowRoomCreationForAuthUsers) || // Allow room creation if authenticated via OIDC
+            roomExist; // Fallback: allow anyone if room exists
+
+        log.debug(logMessage, {
+            OIDCUserAuthenticated,
+            hostUserAuthenticated,
+            roomExist,
+            roomCount,
+            extraInfo: {
+                roomId,
+                OIDCUserEnabled: OIDC.enabled,
+                hostProtected: hostCfg.protected,
+                hostAuthenticated: hostCfg.authenticated,
+                OIDCAllowRoomCreationForAuthUsers,
+            },
+            allowRoomAccess,
+        });
+
+        return allowRoomAccess;
+    }
+
+    async function roomExistsForUser(room) {
+        if (hostCfg.protected || hostCfg.user_auth) {
+            // Check if passed room exists
+            if (hostCfg.users_from_db && hostCfg.api_room_exists) {
+                try {
+                    const response = await axios.post(
+                        hostCfg.api_room_exists,
+                        {
+                            room: room,
+                            api_secret_key: hostCfg.users_api_secret_key,
+                        },
+                        {
+                            timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                        }
+                    );
+                    log.debug('AXIOS roomExistsForUser', { room: room, exists: true });
+                    return response.data && response.data.message === true;
+                } catch (error) {
+                    log.error('AXIOS roomExistsForUser error', error.message);
+                    return false;
+                }
+            }
+        }
+    }
+
+    async function getUserAllowedRooms(username, password) {
+        // Gel user allowed rooms from db...
+        if (hostCfg.protected && hostCfg.users_from_db && hostCfg.users_api_rooms_allowed) {
+            try {
+                // Using either email or username, as the username can also be an email here.
+                const response = await axios.post(
+                    hostCfg.users_api_rooms_allowed,
+                    {
+                        email: username,
+                        username: username,
+                        password: password,
+                        api_secret_key: hostCfg.users_api_secret_key,
+                    },
+                    {
+                        timeout: 5000, // Timeout set to 5 seconds (5000 milliseconds)
+                    }
+                );
+                const allowedRooms = response.data ? response.data.message : {};
+                log.debug('AXIOS getUserAllowedRooms', allowedRooms);
+                return allowedRooms;
+            } catch (error) {
+                log.error('AXIOS getUserAllowedRooms error', error.message);
+                return {};
+            }
+        }
+
+        // Get allowed rooms for user from config.js file
+        if (hostCfg.protected && !hostCfg.users_from_db) {
+            const isOIDCEnabled = config?.security?.oidc?.enabled;
+
+            const user = hostCfg.users.find((user) => user.displayname === username || user.username === username);
+
+            if (!isOIDCEnabled && !user) {
+                log.debug('getUserAllowedRooms - user not found', username);
+                return false;
+            }
+            log.debug('CONFIG getUserAllowedRooms', user.allowed_rooms);
+            return user.allowed_rooms;
+        }
+
+        log.debug('getUserAllowedRooms *');
+        return ['*'];
+    }
+
+    async function isRoomAllowedForUser(message, username, room) {
+        if (!username || !room) {
+            log.debug('isRoomAllowedForUser - missing username or room', { username, room });
+            return false;
+        }
+
+        const logData = { message, username, room };
+        log.debug('isRoomAllowedForUser ------>', logData);
+
+        try {
+            const isOIDCEnabled = config?.security?.oidc?.enabled;
+
+            if (hostCfg.protected || hostCfg.user_auth) {
+                // Check API first if configured
+                if (hostCfg.users_from_db && hostCfg.users_api_room_allowed) {
+                    try {
+                        const response = await axios.post(
+                            hostCfg.users_api_room_allowed,
+                            {
+                                email: username,
+                                username: username,
+                                room: room,
+                                api_secret_key: hostCfg.users_api_secret_key,
+                            },
+                            {
+                                timeout: hostCfg.users_api_timeout || 5000,
+                            }
+                        );
+
+                        if (response.data && (response.data === true || response.data.message === true)) {
+                            log.debug('AXIOS isRoomAllowedForUser - allowed access', { room, username });
+                            return true;
+                        }
+                        log.debug('AXIOS isRoomAllowedForUser - denied access', { room, username });
+                        return false;
+                    } catch (error) {
+                        log.error('AXIOS isRoomAllowedForUser - check failed', error.message);
+                        // Fail closed (deny access) if API check fails
+                        return false;
+                    }
+                }
+
+                // Check presenter list
+                if (hostCfg?.presenters?.list?.includes(username)) {
+                    log.debug('isRoomAllowedForUser - User in presenters list', { username });
+                    return true;
+                }
+
+                // Find user in configuration
+                const user = hostCfg.users?.find((u) => u.displayname === username || u.username === username);
+
+                // For OIDC, we might want additional checks even when enabled
+                if (isOIDCEnabled) {
+                    log.debug('isRoomAllowedForUser - OIDC enabled, allowing access', { username });
+                    return true;
+                }
+
+                if (!user) {
+                    log.debug('isRoomAllowedForUser - User not found in configuration', { username });
+                    return false;
+                }
+
+                // Check allowed rooms
+                const isAllowed =
+                    !user.allowed_rooms || user.allowed_rooms.includes('*') || user.allowed_rooms.includes(room);
+
+                log.debug(
+                    isAllowed ? 'isRoomAllowedForUser - Room allowed' : 'isRoomAllowedForUser - Room not allowed',
+                    { room, username }
+                );
+                return isAllowed;
+            }
+
+            log.debug('isRoomAllowedForUser - No protection enabled, allowing access', { room, username });
+            return true;
+        } catch (error) {
+            log.error('isRoomAllowedForUser - Unexpected error', error);
+            return false; // Fail closed
+        }
+    }
+
+    async function getPeerGeoLocation(ip) {
+        const endpoint = config?.integrations?.IPLookup?.getEndpoint(ip);
+        log.debug('Get peer geo', { ip: ip, endpoint: endpoint });
+        return axios
+            .get(endpoint)
+            .then((response) => response.data)
+            .catch((error) => log.error(error));
+    }
+
+    function getIP(req) {
+        // Security: only trust X-Forwarded-For when behind a trusted reverse proxy.
+        const forwarded = trustProxy ? req.headers['x-forwarded-for'] || req.headers['X-Forwarded-For'] : null;
+        if (forwarded) {
+            return forwarded.split(',')[0].trim();
+        }
+        return req.socket.remoteAddress || req.ip;
+    }
+
+    function getIpSocket(socket) {
+        // Security: only trust X-Forwarded-For when behind a trusted reverse proxy.
+        const forwarded = trustProxy
+            ? socket.handshake.headers['x-forwarded-for'] || socket.handshake.headers['X-Forwarded-For']
+            : null;
+        if (forwarded) {
+            return forwarded.split(',')[0].trim();
+        }
+        return socket.handshake.address;
+    }
+
+    function updateHostAuthenticatedFlag() {
+        hostCfg.authenticated = !hostCfg.protected || authHost.getAuthorizedIPs().length > 0;
+    }
+
+    function allowedIP(ip) {
+        const authorizedIPs = authHost.getAuthorizedIPs();
+        const authorizedIP = authHost.isAuthorizedIP(ip);
+        log.debug('Allowed IPs', {
+            ip: ip,
+            authorizedIP: authorizedIP,
+            authorizedIPs: authorizedIPs,
+        });
+        return authHost != null && authorizedIP;
+    }
+
+    function removeIP(socket) {
+        if (hostCfg.protected) {
+            const ip = getIpSocket(socket);
+            if (ip && allowedIP(ip)) {
+                authHost.deleteIP(ip);
+                hostCfg.authenticated = false;
+                log.debug('Remove IP from auth', {
+                    removedIp: ip,
+                    authorizedIps: authHost.getAuthorizedIPs(),
+                });
+            }
+        }
+    }
+}
+
+// ####################################################
+// AUTHENTICATION HELPERS
+// ####################################################
+
+function getBearerToken(req) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return null;
+    }
+    return authHeader.split(' ')[1] || null;
+}
+
+async function getScheduleMeetingAuthState(req) {
+    const denied = { authorized: false, requester: 'anonymous' };
+
+    if (OIDC.enabled && req.oidc?.isAuthenticated()) {
+        return {
+            authorized: true,
+            requester: req.oidc?.user?.email || req.oidc?.user?.name || req.oidc?.user?.sub || 'oidc-user',
+        };
+    }
+
+    if (hostCfg.protected && allowedIP(getIP(req))) {
+        return { authorized: true, requester: 'host-ip-auth' };
+    }
+
+    if (hostCfg.user_auth) {
+        const token = getBearerToken(req);
+        if (!token) return denied;
+
+        try {
+            if (!(await isValidToken(token))) return denied;
+
+            const { username, password } = checkXSS(decodeToken(token));
+            const isPeerValid = await isAuthPeer(username, password);
+
+            return isPeerValid ? { authorized: true, requester: username } : denied;
+        } catch (error) {
+            log.warn('scheduleMeeting auth token validation failed', {
+                error: error.message,
+                ip: authHost.getIP(req),
+            });
+            return denied;
+        }
+    }
+
+    return denied;
+}
+
+// ####################################################
+// GRACEFUL SHUTDOWN HANDLERS
+// ####################################################
+
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+    if (isShuttingDown) {
+        log.warn(`${signal} received again, forcing exit...`);
+        process.exit(1);
+    }
+
+    isShuttingDown = true;
+    log.info(`${signal} received, starting graceful shutdown...`);
+
+    try {
+        // 1. Stop accepting new connections
+        log.debug('Closing HTTP server...');
+        server.close(() => {
+            log.info('HTTP server closed');
+        });
+
+        // 2. Close all active rooms and notify peers
+        log.debug(`Closing ${roomList.size} active rooms...`);
+        for (const [roomId, room] of roomList.entries()) {
+            try {
+                // Notify all peers in the room
+                room.sendToAll('serverShutdown', { message: 'Server is shutting down' });
+
+                // Stop any active RTMP streams
+                if (room.isRtmpFileStreamerActive()) {
+                    await room.stopRTMP();
+                }
+                if (room.isRtmpUrlStreamerActive()) {
+                    await room.stopRTMPfromURL();
+                }
+
+                // Remove all peers from the room
+                const peers = room.getPeers();
+                for (const [peerId] of peers) {
+                    room.removePeer(peerId);
+                }
+
+                roomList.delete(roomId);
+            } catch (err) {
+                log.error(`Error closing room ${roomId}:`, err.message);
+            }
+        }
+
+        // 3. Close all RTMP streams
+        log.debug(`Closing ${Object.keys(streams).length} RTMP streams...`);
+        for (const [key, stream] of Object.entries(streams)) {
+            try {
+                if (stream && typeof stream.end === 'function') {
+                    stream.end();
+                }
+                delete streams[key];
+            } catch (err) {
+                log.error(`Error closing RTMP stream ${key}:`, err.message);
+            }
+        }
+
+        // 4. Disconnect all Socket.IO clients
+        log.debug('Disconnecting all Socket.IO clients...');
+        const sockets = await io.fetchSockets();
+        for (const socket of sockets) {
+            socket.disconnect(true);
+        }
+
+        // 5. Close Socket.IO server
+        log.debug('Closing Socket.IO server...');
+        io.close();
+
+        // 6. Close all mediasoup workers
+        log.debug(`Closing ${workers.length} mediasoup workers...`);
+        for (const worker of workers) {
+            try {
+                worker.close();
+            } catch (err) {
+                log.error('Error closing mediasoup worker:', err.message);
+            }
+        }
+
+        // 7. Cleanup HTML injector
+        log.debug('Cleaning up HTML injector...');
+        htmlInjector.cleanup();
+
+        // 8. Close ngrok if active
+        if (config?.integrations?.ngrok?.enabled) {
+            log.debug('Closing ngrok tunnel...');
+            await ngrok.kill();
+        }
+
+        log.info('Graceful shutdown completed successfully');
+        process.exit(0);
+    } catch (err) {
+        log.error('Error during graceful shutdown:', err.message);
+        process.exit(1);
+    }
+}
+
+// Set a timeout for forced shutdown if graceful shutdown takes too long
+function forceShutdown(signal) {
+    setTimeout(() => {
+        log.error(`Graceful shutdown timeout exceeded, forcing exit...`);
+        process.exit(1);
+    }, 30000); // 30 seconds timeout
+}
+
+process.on('SIGINT', () => {
+    log.debug('PROCESS', 'SIGINT');
+    forceShutdown('SIGINT');
+    gracefulShutdown('SIGINT');
+});
+
+process.on('SIGTERM', () => {
+    log.debug('PROCESS', 'SIGTERM');
+    forceShutdown('SIGTERM');
+    gracefulShutdown('SIGTERM');
+});
+
+// Handle uncaught exceptions and rejections
+process.on('uncaughtException', (err) => {
+    log.error('Uncaught Exception:', err);
+    forceShutdown('uncaughtException');
+    gracefulShutdown('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    log.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't exit on unhandled rejection, just log it
+});
